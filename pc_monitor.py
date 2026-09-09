@@ -190,7 +190,7 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
                    # never have to hand friends a new copy again. Set update_url
                    # to a raw GitHub/Gist URL of pc_monitor.py. Blank = off.
                    "auto_update": True,
-                   "update_url": "",
+                   "update_url": "https://raw.githubusercontent.com/Giveup911/Monitoring/main/pc_monitor.py",
                    "update_check_interval_hours": 2,
                    "auto_update_restart": True}
 
