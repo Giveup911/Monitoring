@@ -142,7 +142,7 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 
 # generic, unlabeled SuperIO sensors (unconnected motherboard headers that
 # read a fixed bogus value forever, e.g. a constant 104C phantom) - matched
