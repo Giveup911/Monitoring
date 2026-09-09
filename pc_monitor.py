@@ -169,8 +169,12 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
                    # stalls, try the Win+Ctrl+Shift+B graphics-stack reset. It's
                    # non-destructive but a long shot once a driver is fully hung.
                    "gpu_stall_recovery": False,
-                   "gpu_stall_flag_samples": 3,   # frozen samples before flagging
-                   "gpu_stall_recover_samples": 5, # frozen samples before recovery
+                   "gpu_stall_flag_samples": 3,   # (legacy, superseded by seconds)
+                   "gpu_stall_recover_samples": 5, # (legacy, superseded by seconds)
+                   # time-based GPU-stall thresholds (adaptive polling means
+                   # sample counts map to different real durations - #10)
+                   "gpu_stall_flag_seconds": 3.0,
+                   "gpu_stall_recover_seconds": 5.0,
                    # write a plain-text crash report to the Desktop on the next
                    # launch after a session that didn't shut down cleanly
                    "crash_dump_to_desktop": True,
@@ -214,27 +218,35 @@ def _load_config():
 _CONFIG_LOCK = threading.Lock()
 
 
+def _atomic_write_json(path, obj):
+    """#18: write to a temp file, flush+fsync, then os.replace - so a power
+    loss or kill mid-write can never leave a half-written (corrupt) config
+    that the next launch fails to parse. os.replace is atomic on Windows."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _save_config(cfg):
     with _CONFIG_LOCK:
         try:
-            with open(CONFIG_PATH, "w") as f:
-                json.dump(cfg, f, indent=2)
+            _atomic_write_json(CONFIG_PATH, cfg)
             return True
         except OSError:
             return False
 
 
 def _set_config(key, value):
-    """Mutates the shared CONFIG dict and persists it, under a lock -
-    CONFIG gets written from the GUI thread, the auto-setup worker
-    thread, and read from the polling thread, so plain unsynchronized
-    dict mutation + file writes from multiple threads is worth
-    avoiding even though the practical risk is low."""
+    """Mutates the shared CONFIG dict and persists it atomically, under a
+    lock - CONFIG gets written from the GUI thread, the auto-setup worker
+    thread, and read from the polling thread."""
     with _CONFIG_LOCK:
         CONFIG[key] = value
         try:
-            with open(CONFIG_PATH, "w") as f:
-                json.dump(CONFIG, f, indent=2)
+            _atomic_write_json(CONFIG_PATH, CONFIG)
             return True
         except OSError:
             return False
@@ -620,6 +632,29 @@ class EventLogWatcher:
         except Exception:
             return []
         last = self._last_record.get(log_name)
+        # #28: a cleared or rolled-over log restarts RecordNumber at a low
+        # value. If the newest record is now BELOW our high-water mark, the
+        # log was cleared - re-baseline to the new newest and report nothing
+        # this poll, instead of silently missing every new event until the
+        # numbers climb back past the old mark.
+        try:
+            peek = self._read_chunk(hand)
+            if peek and last is not None and peek[0].RecordNumber < last:
+                self._last_record[log_name] = peek[0].RecordNumber
+                try:
+                    win32evtlog.CloseEventLog(hand)
+                except Exception:
+                    pass
+                return []
+            # reopen so the backward-read cursor starts at the newest again
+            win32evtlog.CloseEventLog(hand)
+            hand = win32evtlog.OpenEventLog(None, log_name)
+        except Exception:
+            try:
+                win32evtlog.CloseEventLog(hand)
+            except Exception:
+                pass
+            return []
         new = []
         newest_seen = last
         try:
@@ -776,6 +811,7 @@ class NetMonitor:
         self.ping_host = ping_host
         self._last_totals = None
         self._last_time = None
+        self._last_ifaces = None      # #8: the adapter set the baseline was for
         self._last_ping_time = None
         self._last_ping = (None, None)  # (loss_percent, ms)
 
@@ -788,23 +824,35 @@ class NetMonitor:
         pool = real if real else per_nic  # never end up with nothing to report
         sent = sum(io.bytes_sent for io in pool.values())
         recv = sum(io.bytes_recv for io in pool.values())
-        return sent, recv
+        return frozenset(pool), sent, recv  # #8: also report which adapters
 
     def sample(self):
         stats = {}
         try:
             totals = self._real_adapter_totals()
-            now = time.time()
+            now = time.monotonic()  # #52: monotonic - immune to clock changes
             if totals is not None:
-                sent, recv = totals
-                if self._last_totals is not None:
+                ifaces, sent, recv = totals
+                # #7/#8: only compute a rate against a comparable baseline.
+                # If the adapter SET changed (Wi-Fi<->Ethernet) or a counter
+                # rolled BACKWARD (interface/counter reset), the summed totals
+                # aren't a continuous series - reset the baseline and emit no
+                # rate this sample instead of a bogus spike or a false zero.
+                comparable = (self._last_totals is not None
+                              and ifaces == self._last_ifaces
+                              and sent >= self._last_totals[0]
+                              and recv >= self._last_totals[1])
+                if comparable:
                     dt = max(now - self._last_time, 0.001)
-                    d_sent = max(sent - self._last_totals[0], 0)
-                    d_recv = max(recv - self._last_totals[1], 0)
+                    d_sent = sent - self._last_totals[0]
+                    d_recv = recv - self._last_totals[1]
                     stats["sent_mbps"] = round(d_sent * 8 / dt / 1_000_000, 2)
                     stats["recv_mbps"] = round(d_recv * 8 / dt / 1_000_000, 2)
+                elif self._last_totals is not None:
+                    stats["net_baseline_reset"] = True
                 self._last_totals = (sent, recv)
                 self._last_time = now
+                self._last_ifaces = ifaces
                 stats["sent_gb_total"] = round(sent / 1024**3, 3)
                 stats["recv_gb_total"] = round(recv / 1024**3, 3)
         except Exception:
@@ -1089,6 +1137,7 @@ class PresentMonWatcher:
         self._ft_idx = None
         self.column_error = None      # surfaced when the CSV header isn't recognized
         self.launch_error = None      # surfaced when PresentMon fails to start
+        self._just_rotated = False    # #21: set on rotation so the poll loop marks the gap
         self._priority_lowered = False
         self._launch_checked = True   # only meaningful once _start sets it False
         self._stderr_path = None
@@ -1185,6 +1234,11 @@ class PresentMonWatcher:
             pass
         if self.exe_path:
             self._start(self.exe_path)
+        # #21: signal that a capture gap just occurred (teardown + relaunch),
+        # so the poll loop can log an explicit marker instead of leaving an
+        # unexplained blank in the frame data that could look like the game
+        # stopping.
+        self._just_rotated = True
 
     def _stop_orphaned_instances(self):
         if psutil is None or not self.exe_path:
@@ -1663,11 +1717,24 @@ def read_system_stats(proc_monitor, net_monitor, cached_cpu_counts=None, cached_
     re-querying psutil for them on every single poll is pure waste.
     Left as optional so a one-off caller (tests, scripts) can still
     just call this directly and get correct, freshly-computed values."""
-    cpu = {"percent": psutil.cpu_percent(interval=None)}
+    # #6: total and per-core must come from ONE sample interval. Two separate
+    # cpu_percent(interval=None) calls back-to-back measure different (and for
+    # the second, near-zero) windows, so they wouldn't correspond. Take the
+    # per-core reading once and derive the total from it - one interval, and
+    # total == mean(per-core) by construction.
+    cpu = {}
     try:
-        cpu["percent_per_core"] = psutil.cpu_percent(interval=None, percpu=True)
+        per_core = psutil.cpu_percent(interval=None, percpu=True)
+        if per_core:
+            cpu["percent_per_core"] = per_core
+            cpu["percent"] = round(sum(per_core) / len(per_core), 1)
+        else:
+            cpu["percent"] = psutil.cpu_percent(interval=None)
     except Exception:
-        pass
+        try:
+            cpu["percent"] = psutil.cpu_percent(interval=None)
+        except Exception:
+            cpu["percent"] = None
     if cached_cpu_counts is not None:
         cpu["count_logical"], cpu["count_physical"] = cached_cpu_counts
     else:
@@ -2054,15 +2121,40 @@ class LogManager:
         self._fh = None
         self._path = None
         self._size = 0
-        # one-time real scan at startup to establish an accurate baseline
-        # (covers files left over from a previous session) - everything
-        # after this is incremental
+        # #14: serialize all state/handle mutations. One PollThread is the
+        # norm, but a lock makes write/rotate/delete safe even if the
+        # overlapping-thread guard (#1) is ever defeated, and it also guards
+        # the shutdown-marker write racing the poll thread's last write.
+        self._lock = threading.RLock()
+        # #16/#17: explicit logger health so the app can never look like it's
+        # recording when writes are actually failing (disk full, drive gone).
+        self.healthy = True
+        self.last_error = None
+        self.consecutive_failures = 0
+        self.last_ok_time = time.time()
+        # #54/#72: files the startup crash analysis still needs - never
+        # deleted by cap enforcement until released.
+        self._protected = set()
         self._total_size = sum(sz for _, sz in self._all_files())
         self._open_new_file()
 
+    def protect(self, *paths):
+        with self._lock:
+            for p in paths:
+                if p:
+                    self._protected.add(os.path.abspath(p))
+
+    def unprotect(self, *paths):
+        with self._lock:
+            for p in paths:
+                self._protected.discard(os.path.abspath(p))
+
     def _open_new_file(self):
         if self._fh:
-            self._fh.close()
+            try:
+                self._fh.close()
+            except Exception:
+                pass
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = os.path.join(self.logs_dir, f"pc_monitor_{ts}")
         path = base + ".jsonl"
@@ -2071,24 +2163,49 @@ class LogManager:
             path = f"{base}_{n}.jsonl"
             n += 1
         self._path = path
-        self._fh = open(self._path, "a", buffering=1)
+        self._fh = open(self._path, "a", buffering=1, encoding="utf-8")  # #62
         self._size = 0
 
     def write(self, row: dict):
         line = json.dumps(row) + "\n"
         b = len(line.encode("utf-8"))
-        if self._size and self._size + b > self.max_file_bytes:
-            self._open_new_file()
-        self._fh.write(line)
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
-        self._size += b
-        self._total_size += b
-        self._enforce_total_cap()
+        with self._lock:
+            try:
+                if self._size and self._size + b > self.max_file_bytes:
+                    self._open_new_file()
+                self._fh.write(line)
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+                self._size += b
+                self._total_size += b
+                self._enforce_total_cap()
+                self.consecutive_failures = 0
+                self.last_ok_time = time.time()
+                self.healthy = True
+            except Exception as e:
+                # #16/#17: a failed write must not silently pass. Record the
+                # failure, try to recover a usable handle + resync the size
+                # accounting for next time, and re-raise so the caller can
+                # persist a separate error record and surface the health state.
+                self.consecutive_failures += 1
+                self.last_error = f"{type(e).__name__}: {e}"
+                self.healthy = False
+                try:
+                    self._open_new_file()
+                    self._total_size = sum(sz for _, sz in self._all_files())
+                except Exception:
+                    pass
+                raise
 
     def _all_files(self):
         paths = sorted(glob.glob(os.path.join(self.logs_dir, "pc_monitor_*.jsonl")))
-        return [(p, os.path.getsize(p)) for p in paths]
+        out = []
+        for p in paths:
+            try:
+                out.append((p, os.path.getsize(p)))
+            except OSError:
+                continue
+        return out
 
     def _enforce_total_cap(self):
         if self._total_size <= self.max_total_bytes:
@@ -2099,11 +2216,19 @@ class LogManager:
                 break
             if path == self._path:
                 continue
+            if os.path.abspath(path) in self._protected:
+                continue  # #54/#72: don't delete the crashed session pre-analysis
             try:
                 os.remove(path)
                 self._total_size -= sz
             except OSError:
                 pass
+
+    def health(self):
+        with self._lock:
+            return {"healthy": self.healthy, "last_error": self.last_error,
+                    "consecutive_failures": self.consecutive_failures,
+                    "seconds_since_ok": round(time.time() - self.last_ok_time, 1)}
 
     def current_path(self):
         return self._path
@@ -2112,8 +2237,18 @@ class LogManager:
         return self._total_size
 
     def close(self):
-        if self._fh:
-            self._fh.close()
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.flush()
+                    os.fsync(self._fh.fileno())
+                except Exception:
+                    pass
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
 
 
 def read_range(logs_dir, start_dt=None, end_dt=None):
@@ -2151,6 +2286,13 @@ def read_range(logs_dir, start_dt=None, end_dt=None):
     return rows
 
 
+def _safe_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def previous_session_status(logs_dir, current_path=None):
     """Looks at the most recent PRIOR log file (not the one this run just
     opened) and decides whether the last session ended cleanly.
@@ -2168,6 +2310,10 @@ def previous_session_status(logs_dir, current_path=None):
     except Exception:
         return None
     prior = [f for f in files if os.path.abspath(f) != os.path.abspath(current_path or "")]
+    # #25: skip trailing empty/near-empty files (e.g. a session that opened a
+    # log then died before writing anything) so we assess the real previous
+    # session, not a zero-byte artifact.
+    prior = [f for f in prior if _safe_size(f) > 2]
     if not prior:
         return None
     path = prior[-1]
@@ -2225,21 +2371,30 @@ def _find_recent_minidumps(after_iso):
     minidumps, the full memory dump, and GPU-specific LiveKernelReports
     (where display-driver TDRs land)."""
     found = []
+    seen = set()  # #59: the recursive + non-recursive globs overlap
     try:
         after = datetime.fromisoformat(after_iso) if after_iso else None
     except Exception:
         after = None
+    # #60: if we couldn't parse the crash time, don't dump EVERY historical
+    # minidump as if it were related - only keep ones from the last day.
+    if after is None:
+        after = datetime.now() - timedelta(days=1)
     pats = (r"C:\Windows\Minidump\*.dmp", r"C:\Windows\MEMORY.DMP",
             r"C:\Windows\LiveKernelReports\*.dmp",
             r"C:\Windows\LiveKernelReports\**\*.dmp")
     for pat in pats:
         try:
             for p in glob.glob(pat, recursive=True):
+                rp = os.path.abspath(p)
+                if rp in seen:
+                    continue
                 try:
                     mt = datetime.fromtimestamp(os.path.getmtime(p))
                 except OSError:
                     continue
-                if after is None or mt >= after:
+                if mt >= after:
+                    seen.add(rp)
                     found.append((p, mt.isoformat(timespec="seconds")))
         except Exception:
             continue
@@ -2364,7 +2519,11 @@ def crash_acceleration(logs_dir, n=8):
     except Exception:
         return None
     spans = [s for s in (_session_span(f) for f in files[-n:]) if s]
-    crashed = [s for s in spans if s["crashed"] and s["dur"] is not None]
+    # #43: only compare sessions that ran long enough to be meaningful. A
+    # startup crash-loop produces several ~seconds-long sessions whose
+    # durations aren't comparable to a real gaming session - excluding the
+    # trivially short ones avoids a bogus "accelerating" verdict.
+    crashed = [s for s in spans if s["crashed"] and s["dur"] is not None and s["dur"] >= 30]
     if len(crashed) < 2:
         return None
     d0, d1 = crashed[-2]["dur"], crashed[-1]["dur"]
@@ -2409,22 +2568,44 @@ def analyze_crash(path):
     classification = "abrupt stop with no clear precursor in the captured data"
     evidence = []
 
-    # GPU stall: explicit flag, or a frozen GPU signature across the last rows -
-    # but only call it a hang if the GPU was actually WORKING when it froze.
-    # An idle desktop parks the GPU at constant values, so without this an
-    # ordinary force-close at idle would be misread as a GPU hang.
-    gpu_stalled = any(o.get("gpu_stalled") for o in metrics[-15:])
-    if not gpu_stalled and len(metrics) >= 4:
+    # #23: don't mistake a SENSOR/LHM connection loss for a GPU failure. If the
+    # tail is dominated by sensor_error rows, the GPU telemetry being "frozen"
+    # (absent) is just LHM going away, not a driver hang.
+    tail_metrics = metrics[-15:] if metrics else []
+    sensor_lost = bool(tail_metrics) and sum(
+        1 for o in tail_metrics if o.get("sensor_error")) >= max(3, len(tail_metrics) // 2)
+
+    # GPU stall: prefer the live confidence grade the poll thread recorded
+    # (#9/#24); fall back to detecting a frozen-while-recently-active signature
+    # in the tail. Only call it a hang when the GPU was actually working.
+    live_conf = next((o.get("gpu_stall_confidence") for o in reversed(tail_metrics)
+                      if o.get("gpu_stall_confidence")), None)
+    gpu_stalled = any(o.get("gpu_stalled") for o in tail_metrics)
+    if not gpu_stalled and len(metrics) >= 4 and not sensor_lost:
         tail = metrics[-6:]
         sigs = [_gpu_signature(o.get("sensors") or {}) for o in tail]
         sigs = [s for s in sigs if s is not None]
         active = any(_gpu_active(o.get("sensors") or {}) for o in tail)
         if len(sigs) >= 4 and len(set(sigs)) == 1 and active:
             gpu_stalled = True
-    if gpu_stalled:
-        classification = "GPU driver hang (GPU sensors froze while the rest kept updating)"
-        evidence.append("GPU readings stopped changing before the end - the "
-                        "driver stopped responding (classic TDR / GPU hang).")
+    if sensor_lost and not gpu_stalled:
+        classification = ("sensor/LibreHardwareMonitor connection was lost before "
+                          "the end - GPU state is unknown, not necessarily a hang")
+        evidence.append("The final samples had sensor errors (LHM unreachable), so "
+                        "absent GPU data here is a monitoring gap, not proof of a GPU hang.")
+    elif gpu_stalled:
+        # #24: hedge the wording to match the evidence strength.
+        conf = live_conf or "possible"
+        if conf == "likely":
+            classification = ("GPU driver hang - LIKELY (GPU sensors froze while the "
+                              "rest kept updating, with corroborating signals)")
+        else:
+            classification = ("GPU sensors froze while the rest kept updating - "
+                              "POSSIBLE GPU driver hang (no independent corroboration)")
+        evidence.append("GPU readings stopped changing before the end while CPU/system "
+                        "readings continued - the pattern of a driver stall / TDR.")
+        evidence.append("NOTE: frozen sensor values are strong but not definitive on "
+                        "their own; confirm with a Display/nvlddmkm 4101 or WHEA event.")
 
     # thermal
     hot = None
@@ -2485,7 +2666,8 @@ def analyze_crash(path):
 
     return {"path": path, "last_ts": last_ts, "classification": classification,
             "evidence": evidence, "inventory": inv, "gpu_stalled": gpu_stalled,
-            "events": events, "proc_exits": exits}
+            "events": events, "proc_exits": exits,
+            "forced_close": any(o.get("kind") == "forced_close" for o in objs)}
 
 
 def _desktop_dir():
@@ -2664,6 +2846,10 @@ def write_crash_report_to_desktop(path, last_ts, win_events=None, accel=None, an
     lines.append("LIKELY CAUSE:")
     lines.append(f"  {a.get('classification')}")
     lines.append("")
+    if a.get("termination_note"):
+        lines.append("WHAT ENDED (PC vs monitor):")
+        lines.append(f"  {a['termination_note']}")
+        lines.append("")
     if accel and accel.get("note"):
         lines.append("CRASH TREND:")
         lines.append(f"  {accel['note']}")
@@ -2722,6 +2908,43 @@ class PollThread(threading.Thread):
         self.interval_holder = interval_holder
         self.stop_event = stop_event
 
+    def _put(self, item):
+        # #4/#5/#74: the GUI queue is display transport, NOT evidence storage
+        # (everything important is written to disk first). So it's bounded and
+        # never blocks the poll loop: if the GUI has stalled and the queue is
+        # full, drop the OLDEST item to make room for the newest rather than
+        # letting the producer grow memory without limit during exactly the
+        # instability this app exists to record.
+        try:
+            self.out_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self.out_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.out_queue.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _log(self, rec):
+        # #33/#68/#74: write to disk FIRST (the evidence), then queue for the
+        # GUI. Returns True on success. On failure, try to persist a separate
+        # minimal error record so the failure itself leaves a trace on disk
+        # (the failed row never made it, so its error couldn't be in it).
+        try:
+            self.log_manager.write(rec)
+            return True
+        except Exception as e:
+            try:
+                self.log_manager.write({
+                    "kind": "log_error",
+                    "error": f"{type(e).__name__}: {e}",
+                    "ts": datetime.now().isoformat(timespec="seconds")})
+            except Exception:
+                pass  # logger is down; health state carries it (see LogManager)
+            return False
+
     def run(self):
         _lower_thread_priority()
         pythoncom = None
@@ -2756,21 +2979,28 @@ class PollThread(threading.Thread):
 
         # --- adaptive sampling state ---
         adaptive = bool(CONFIG.get("adaptive_poll", True))
-        fast_interval = float(CONFIG.get("fast_poll_interval", 1.0))
-        fast_gpu_load = float(CONFIG.get("fast_gpu_load", 50))
-        fast_temp_c = float(CONFIG.get("fast_temp_c", 80))
+        # #50: validate config-driven thresholds so a bad value in the JSON
+        # can't wedge the loop (0s spin) or disable adaptive behaviour silently.
+        def _num(key, default, lo, hi):
+            try:
+                return min(max(float(CONFIG.get(key, default)), lo), hi)
+            except (TypeError, ValueError):
+                return default
+        fast_interval = _num("fast_poll_interval", 1.0, 0.2, 60.0)
+        fast_gpu_load = _num("fast_gpu_load", 50, 0, 100)
+        fast_temp_c = _num("fast_temp_c", 80, 0, 150)
         recent_event_until = 0.0        # stay fast briefly after an error event
         last_event_scan = 0.0           # wall-clock gate for the event-log scan
         EVENT_SCAN_MIN_INTERVAL = 2.0   # don't reopen both logs more often than this
 
         # --- GPU-stall (driver-hang) detection state ---
         gpu_prev_sig = None
-        gpu_frozen_count = 0            # consecutive identical GPU signatures
-        gpu_stall_since = None
+        gpu_frozen_since = None         # #10: monotonic time the signature froze
+        gpu_last_active_mono = None     # #11: last time the GPU had real load
         gpu_recovery_tried = False
-        stall_flag_n = int(CONFIG.get("gpu_stall_flag_samples", 3))
-        stall_recover_n = int(CONFIG.get("gpu_stall_recover_samples", 5))
+        gpu_flagged = False             # avoid re-emitting every frozen sample
         recovery_enabled = bool(CONFIG.get("gpu_stall_recovery", False))
+        GPU_RECENT_ACTIVE_S = 30.0
         last_poll_wall = None           # for real inter-sample dt
 
         # --- session inventory header (once, first thing) ---
@@ -2785,22 +3015,29 @@ class PollThread(threading.Thread):
             header = {"kind": "session_start",
                       "ts": datetime.now().isoformat(timespec="seconds"),
                       "inventory": inv}
-            try:
-                self.log_manager.write(header)
-            except Exception:
-                pass
-            self.out_queue.put(header)
+            # #69: header write failure is no longer silent - it flows into the
+            # same logger-health state the GUI surfaces.
+            self._log(header)
+            self._put(header)
         except Exception:
             pass
         try:
+            last_sensor_retry = 0.0
             while not self.stop_event.is_set():
-                next_interval = float(self.interval_holder.get("val", 5.0))
+                try:
+                    base_interval = min(max(float(self.interval_holder.get("val", 5.0)), 0.5), 60.0)
+                except (TypeError, ValueError):
+                    base_interval = 5.0
+                next_interval = base_interval
                 try:
                     if not reader.connected:
-                        loops_since_retry += 1
-                        if loops_since_retry >= 6:  # retry roughly every ~30s
+                        # #34: retry on a wall-clock cadence (~30s), not a loop
+                        # count - loop count means wildly different real spacing
+                        # under adaptive polling (30 x 1s vs 30 x 5s).
+                        now_retry = time.monotonic()
+                        if now_retry - last_sensor_retry >= 30:
+                            last_sensor_retry = now_retry
                             reader._try_connect()
-                            loops_since_retry = 0
 
                     row = {"ts": datetime.now().isoformat(timespec="seconds")}
                     now_wall = time.time()
@@ -2851,6 +3088,12 @@ class PollThread(threading.Thread):
                             row["presentmon_error"] = presentmon.column_error
                         elif presentmon.launch_error:
                             row["presentmon_error"] = presentmon.launch_error
+                        # #21/#22: a rotation just tore down + relaunched capture,
+                        # so any frame gap this poll is expected, NOT the game
+                        # stopping - mark it so readers don't misread the gap.
+                        if getattr(presentmon, "_just_rotated", False):
+                            row["presentmon_rotated"] = True
+                            presentmon._just_rotated = False
                     except Exception:
                         pass
 
@@ -2865,35 +3108,53 @@ class PollThread(threading.Thread):
                     # misleading "GPU fine at 62%" in the log.
                     sensors_now = row.get("sensors") or {}
                     sig = _gpu_signature(sensors_now)
-                    if sig is not None and sig == gpu_prev_sig and _gpu_active(sensors_now):
-                        gpu_frozen_count += 1
+                    now_mono = time.monotonic()
+                    if _gpu_active(sensors_now):
+                        gpu_last_active_mono = now_mono
+                    frozen = sig is not None and sig == gpu_prev_sig
+                    if frozen:
+                        if gpu_frozen_since is None:
+                            gpu_frozen_since = now_mono
                     else:
-                        gpu_frozen_count = 0
-                        gpu_stall_since = None
+                        gpu_frozen_since = None
                         gpu_recovery_tried = False
+                        gpu_flagged = False
                     gpu_prev_sig = sig
 
-                    if gpu_frozen_count >= stall_flag_n:
-                        if gpu_stall_since is None:
-                            gpu_stall_since = row["ts"]
-                        row["gpu_stalled"] = True
-                        row["gpu_stalled_since"] = gpu_stall_since
-                        row["gpu_stale"] = True  # GPU readings are last-known, not live
-                        # opt-in, best-effort recovery: one attempt per stall
+                    # #10: threshold on ELAPSED TIME, not sample count (adaptive
+                    # polling makes N samples mean different real durations).
+                    # #11: count it a stall if the GPU was active RECENTLY, not
+                    # only at the exact frozen samples - a real driver hang can
+                    # drop load to 0 as it dies.
+                    flag_s = _num("gpu_stall_flag_seconds", 3.0, 0.5, 120)
+                    recover_s = _num("gpu_stall_recover_seconds", 5.0, 1.0, 300)
+                    recently_active = (gpu_last_active_mono is not None
+                                       and now_mono - gpu_last_active_mono <= GPU_RECENT_ACTIVE_S)
+                    frozen_s = (now_mono - gpu_frozen_since) if gpu_frozen_since is not None else 0.0
+
+                    if frozen and frozen_s >= flag_s and recently_active:
+                        # #9: report the raw observation honestly and grade
+                        # confidence instead of asserting a hang outright.
+                        # Frozen sensors alone = "possible"; corroboration from
+                        # frames stopping or a recent GPU/Display event = "likely".
+                        corroborated = (row.get("presentmon_running") is False
+                                        or time.monotonic() < recent_event_until)
+                        row["gpu_sensor_values_frozen"] = True
+                        row["gpu_frozen_seconds"] = round(frozen_s, 1)
+                        row["gpu_stall_confidence"] = "likely" if corroborated else "possible"
+                        row["gpu_stalled"] = True   # kept for back-compat readers
+                        row["gpu_stale"] = True      # GPU readings are last-known, not live
                         if (recovery_enabled and not gpu_recovery_tried
-                                and gpu_frozen_count >= stall_recover_n):
+                                and frozen_s >= recover_s):
                             gpu_recovery_tried = True
                             ok = attempt_gpu_recovery()
                             rec = {"kind": "recovery_attempt",
-                                   "action": "gpu_reset_hotkey",
-                                   "injected": bool(ok),
+                                   "action": "gpu_reset_hotkey", "injected": bool(ok),
                                    "ts": row["ts"], "time": row["ts"]}
-                            try:
-                                self.log_manager.write(rec)
-                            except Exception:
-                                pass
-                            self.out_queue.put(rec)
+                            self._log(rec)
+                            self._put(rec)
                             row["gpu_recovery_attempted"] = True
+                        gpu_flagged = True
 
                     # --- decide the sampling cadence for the NEXT sleep ---
                     # Base interval comes from the Poll spinbox. Adaptive mode
@@ -2904,7 +3165,10 @@ class PollThread(threading.Thread):
                     # wall-clock gated, so bursting multiplies only the cheap
                     # signals, not the costly ones - which is what keeps a 1s
                     # burst from stealing performance from a game.
-                    base_interval = float(self.interval_holder.get("val", 5.0))
+                    try:
+                        base_interval = min(max(float(self.interval_holder.get("val", 5.0)), 0.5), 60.0)
+                    except (TypeError, ValueError):
+                        base_interval = 5.0
                     next_interval = base_interval
                     if adaptive:
                         max_temp, gpu_load = _danger_from_sensors(row.get("sensors") or {})
@@ -2912,44 +3176,61 @@ class PollThread(threading.Thread):
                             gpu_load is not None and gpu_load >= fast_gpu_load)
                         hot = max_temp is not None and max_temp >= fast_temp_c
                         if (busy or hot or row.get("gpu_stalled")
-                                or time.time() < recent_event_until):
+                                or time.monotonic() < recent_event_until):
                             next_interval = min(fast_interval, base_interval)
                             row["poll_mode"] = "fast"
 
-                    try:
-                        self.log_manager.write(row)
-                    except Exception as e:
-                        row["log_error"] = str(e)
-
-                    self.out_queue.put(row)
+                    # #17/#68: write is disk-first; if it failed, surface the
+                    # logger's health on the row so the GUI can show a
+                    # persistent warning, and a separate log_error record was
+                    # already attempted by _log().
+                    if not self._log(row):
+                        h = self.log_manager.health()
+                        row["log_error"] = h.get("last_error")
+                        row["logging_healthy"] = False
+                    self._put(row)
 
                     # flag heavy processes that vanished since last poll - a
                     # game/app crashing (like the VR title WerFault fired on)
                     # shows up here as a precise exit marker, even when it was
                     # never the foreground window
                     try:
+                        # #13: track (name, create_time) per PID. Windows reuses
+                        # PIDs, so "pid still exists" isn't enough - a new process
+                        # can inherit a crashed one's PID. Treat the tracked
+                        # process as exited if the PID is gone OR now hosts a
+                        # DIFFERENT process (create_time changed).
                         cur_heavy = {}
                         for p in row.get("processes", {}).get("top_cpu", []):
-                            if p.get("pid") and p.get("name") not in (
-                                    "System Idle Process", "System"):
-                                cur_heavy[p["pid"]] = p["name"]
-                        for pid, name in prev_heavy.items():
+                            pid = p.get("pid")
+                            if pid and p.get("name") not in ("System Idle Process", "System"):
+                                ct = None
+                                try:
+                                    ct = psutil.Process(pid).create_time()
+                                except Exception:
+                                    ct = None
+                                cur_heavy[pid] = (p["name"], ct)
+                        for pid, (name, ct) in prev_heavy.items():
                             if pid in cur_heavy:
                                 continue
+                            gone = False
                             try:
-                                still = psutil.pid_exists(pid)
+                                if not psutil.pid_exists(pid):
+                                    gone = True
+                                elif ct is not None:
+                                    try:
+                                        gone = abs(psutil.Process(pid).create_time() - ct) > 1.0
+                                    except Exception:
+                                        gone = True  # can't inspect it -> treat as gone
                             except Exception:
-                                still = True
-                            if not still:
+                                gone = False
+                            if gone:
                                 marker = {
                                     "kind": "proc_exit", "process": name, "pid": pid,
                                     "ts": row["ts"], "time": row["ts"],
                                 }
-                                try:
-                                    self.log_manager.write(marker)
-                                except Exception:
-                                    pass
-                                self.out_queue.put(marker)
+                                self._log(marker)
+                                self._put(marker)
                         prev_heavy = cur_heavy
                     except Exception:
                         pass
@@ -2971,14 +3252,11 @@ class PollThread(threading.Thread):
                                 # "ts", so without this the event is written to
                                 # disk but can never be read back - see read_range
                                 ev["ts"] = ev.get("time")
-                                try:
-                                    self.log_manager.write(ev)
-                                except Exception:
-                                    pass
-                                self.out_queue.put(ev)
+                                self._log(ev)
+                                self._put(ev)
                             if got_event:
                                 # capture the aftermath of any error at high res
-                                recent_event_until = time.time() + 15
+                                recent_event_until = time.monotonic() + 15  # #51 monotonic
                         except Exception:
                             pass
                 except Exception as e:
@@ -2987,10 +3265,12 @@ class PollThread(threading.Thread):
                     # letting the whole thread die silently - especially
                     # important since the installed app runs via
                     # pythonw.exe with no console to print a traceback to.
-                    self.out_queue.put({
+                    perr = {
                         "kind": "poll_error", "error": f"{type(e).__name__}: {e}",
                         "ts": datetime.now().isoformat(timespec="seconds"),
-                    })
+                    }
+                    self._log(perr)   # persist to disk, not just the GUI queue
+                    self._put(perr)
 
                 self.stop_event.wait(next_interval)
         finally:
@@ -3048,7 +3328,8 @@ class App(tk.Tk):
 
         self._setup_style()
 
-        self.queue = queue.Queue()
+        self.queue = queue.Queue(maxsize=5000)  # #4: bounded; producer drops oldest
+        self.closing = False  # #19/#20: set before teardown so workers bail out
         self.log_manager = LogManager(LOGS_DIR)
         self.stop_event = threading.Event()
         self.interval_holder = {"val": 5.0}
@@ -3094,6 +3375,12 @@ class App(tk.Tk):
                          daemon=True).start()
 
     def _crash_report_worker(self, info):
+        # #72/#54: make sure startup log-cap enforcement can't delete the
+        # crashed session out from under the analysis that's about to read it.
+        try:
+            self.log_manager.protect(info["path"])
+        except Exception:
+            pass
         try:
             a = analyze_crash(info["path"])
         except Exception:
@@ -3110,6 +3397,35 @@ class App(tk.Tk):
             win_events = grab_windows_events(start)
         except Exception:
             win_events = []
+        # #44/#65: distinguish "the PC crashed" from "the monitor process died"
+        # (or was force-killed) so we never claim a PC crash that didn't happen.
+        try:
+            kp41 = any(e.get("event_id") == 41 and "Kernel-Power" in (e.get("source") or "")
+                       for e in win_events)
+            bugcheck = any("bugcheck" in (e.get("source") or "").lower()
+                           or e.get("event_id") == 1001 and "BugCheck" in (e.get("source") or "")
+                           for e in win_events)
+            unclean_boot = any(e.get("event_id") == 6008 for e in win_events)  # "unexpected shutdown"
+            py_err = any(e.get("event_id") == 1000 and any(
+                "python" in (d or "").lower() for d in (e.get("detail") or []))
+                for e in win_events)
+            forced = a.get("forced_close")
+            if kp41 or bugcheck or unclean_boot:
+                a["termination_note"] = ("The PC itself went down uncleanly (Windows logged "
+                                          "Kernel-Power 41 / BugCheck / unexpected-shutdown) - "
+                                          "a real hard crash or power loss.")
+            elif py_err:
+                a["termination_note"] = ("Windows logged an Application Error for python/pythonw "
+                                          "- the MONITOR process crashed; the PC may have stayed up.")
+            elif forced:
+                a["termination_note"] = ("The monitor was force-closed while still busy (not "
+                                          "necessarily a system crash).")
+            else:
+                a["termination_note"] = ("No Kernel-Power 41 / BugCheck found yet - if the PC "
+                                          "truly hard-locked this may still appear; otherwise the "
+                                          "monitor may have been killed rather than the PC crashing.")
+        except Exception:
+            pass
         # fold the grabbed events into THIS session's log so History shows them
         for e in win_events:
             rec = dict(e)
@@ -3166,11 +3482,23 @@ class App(tk.Tk):
             except Exception as e:
                 discord_status = f"Discord upload failed ({e})"
 
+        # #72/#54: analysis + export + upload done - the raw data is now
+        # preserved on the Desktop, so it's safe to let cap enforcement
+        # manage the original file again.
+        try:
+            self.log_manager.unprotect(info["path"])
+        except Exception:
+            pass
+
         def finish():
+            if self.closing:  # #19
+                return
             msg = ("Previous session ended WITHOUT a clean shutdown (last data at "
                    f"{a.get('last_ts')}).")
             if a.get("classification"):
                 msg += f"  Likely cause: {a['classification']}."
+            if a.get("termination_note"):
+                msg += "  " + a["termination_note"]
             if accel and accel.get("note"):
                 msg += "  " + accel["note"]
             if win_events:
@@ -3228,10 +3556,11 @@ class App(tk.Tk):
 
             if running:
                 # open but web server off; config is now patched for next time
-                self.after(0, lambda: self.autosetup_lbl.config(
-                    text="LibreHardwareMonitor is open but its web server is "
-                         "off - enable Options > Remote Web Server > Run, or "
-                         "restart it to pick up the auto-config."))
+                if not self.closing:
+                    self.after(0, lambda: self.autosetup_lbl.config(
+                        text="LibreHardwareMonitor is open but its web server is "
+                             "off - enable Options > Remote Web Server > Run, or "
+                             "restart it to pick up the auto-config."))
                 return
 
             try:
@@ -3244,10 +3573,11 @@ class App(tk.Tk):
             else:
                 # first-ever launch: window must stay visible for the one-time
                 # Options step; tell the user what to tick
-                self.after(0, lambda: self.autosetup_lbl.config(
-                    text="Launched LibreHardwareMonitor - in Options, tick "
-                         "Remote Web Server > Run (+ Minimize to Tray, Run On "
-                         "Windows Startup). After that once, it's automatic."))
+                if not self.closing:
+                    self.after(0, lambda: self.autosetup_lbl.config(
+                        text="Launched LibreHardwareMonitor - in Options, tick "
+                             "Remote Web Server > Run (+ Minimize to Tray, Run On "
+                             "Windows Startup). After that once, it's automatic."))
         finally:
             if pythoncom:
                 pythoncom.CoUninitialize()
@@ -3573,23 +3903,42 @@ class App(tk.Tk):
         if self.logging_on:
             self.stop_event.set()
             if self.poll_thread:
-                # covers the worst case: a poll iteration mid-ping (its own
-                # up-to-2s timeout) plus a PresentMon rotation landing in
-                # the same iteration (up to 1s) - a tight join here would
-                # let _start_logging() spin up a new thread before the old
-                # one's actually done, reopening the race this join exists
-                # to close
                 self.poll_thread.join(timeout=4)
+                # #1: if the old thread is still alive, do NOT mark logging
+                # stopped and do NOT let a new PollThread start on top of it
+                # (two threads sharing one LogManager/queue/PresentMon is the
+                # critical race). Show "Stopping..." and keep polling for it
+                # to actually exit via a non-blocking after() check.
+                if self.poll_thread.is_alive():
+                    self.toggle_btn.config(text="Stopping...", state="disabled")
+                    self.after(500, self._await_poll_stop)
+                    return
+                self.poll_thread = None
             self.logging_on = False
             self.toggle_btn.config(text="Start Logging")
         else:
             self._start_logging()
             self.toggle_btn.config(text="Stop Logging")
 
+    def _await_poll_stop(self):
+        """Non-blocking wait for a slow poll thread to finish before allowing
+        Start again - prevents overlapping PollThreads (#1)."""
+        if self.closing:
+            return
+        if self.poll_thread and self.poll_thread.is_alive():
+            self.after(500, self._await_poll_stop)
+            return
+        self.poll_thread = None
+        self.logging_on = False
+        self.toggle_btn.config(text="Start Logging", state="normal")
+
     def _on_interval_change(self):
         try:
-            self.interval_holder["val"] = float(self.interval_var.get())
-        except ValueError:
+            v = float(self.interval_var.get())
+            # #49: clamp to a sane range - 0 or a huge value would break the
+            # loop / adaptive logic; negative/garbage is ignored.
+            self.interval_holder["val"] = min(max(v, 0.5), 60.0)
+        except (ValueError, TypeError):
             pass
 
     def _open_logs_folder(self):
@@ -3796,9 +4145,16 @@ class App(tk.Tk):
                 pythoncom.CoUninitialize()
 
     def _set_autosetup_status(self, text):
-        self.after(0, lambda: self.autosetup_lbl.config(text=text))
+        if self.closing:
+            return
+        try:
+            self.after(0, lambda: self.autosetup_lbl.config(text=text))
+        except Exception:
+            pass
 
     def _finish_autosetup(self, results, lhm_launch_path):
+        if self.closing:
+            return
         self.autosetup_btn.state(["!disabled"])
         self.autosetup_lbl.config(text="Done - see popup")
         self.presentmon_lbl.config(text=self._presentmon_status_text())
@@ -3844,13 +4200,20 @@ class App(tk.Tk):
 
     # -- live updates --
     def _pump_queue(self):
+        if self.closing:  # #19: don't touch widgets during teardown
+            return
         latest_metrics = None
         new_events = []
         poll_error = None
         session_inv = None
+        drained = 0
         try:
-            while True:
+            # #5: cap how many items one GUI callback processes, so a large
+            # backlog can't freeze the UI in a single pass - leftover items
+            # are handled on the next tick (rescheduled sooner when busy).
+            while drained < 800:
                 item = self.queue.get_nowait()
+                drained += 1
                 kind = item.get("kind")
                 if kind in ("event", "proc_exit", "recovery_attempt"):
                     new_events.append(item)
@@ -3858,8 +4221,8 @@ class App(tk.Tk):
                     poll_error = item
                 elif kind == "session_start":
                     session_inv = item
-                elif kind in ("shutdown",):
-                    pass  # markers with no live-UI meaning
+                elif kind in ("shutdown", "forced_close", "log_error"):
+                    pass  # markers with no live-UI meaning (already on disk)
                 else:
                     latest_metrics = item
         except queue.Empty:
@@ -3868,13 +4231,21 @@ class App(tk.Tk):
             self._show_inventory(session_inv.get("inventory") or {})
         if latest_metrics:
             self._update_live(latest_metrics)
-        for ev in new_events:
+        for ev in new_events[-400:]:
             self._add_event_row(ev)
+        # #17: persistent, unmissable warning if the logger has gone unhealthy -
+        # the app must never look like it's recording when writes are failing.
+        if latest_metrics and latest_metrics.get("logging_healthy") is False:
+            self.crash_notice.config(
+                text="CRITICAL: monitoring is running but LOG WRITES ARE FAILING "
+                     f"({latest_metrics.get('log_error')}). Crash evidence is NOT "
+                     "being saved - check disk space / the logs drive.")
         if poll_error:
             self.error_lbl.config(
                 text=f"Polling hit an error at {poll_error['ts']} (still running, "
                      f"will keep retrying): {poll_error['error']}")
-        self.after(1000, self._pump_queue)
+        # reschedule sooner if we hit the cap (backlog remains)
+        self.after(200 if drained >= 800 else 1000, self._pump_queue)
 
     def _show_inventory(self, inv):
         """Surface the session inventory (GPU + driver especially) in the
@@ -4019,6 +4390,18 @@ class App(tk.Tk):
                 ev.get("event_id", ""), detail_txt)
 
     def _add_event_row(self, ev):
+        # #29: the live watcher and the post-crash retrospective grab can both
+        # surface the same Windows event. Dedup by (log, record) so it isn't
+        # shown twice in the Events tab. Only Windows events have a record;
+        # proc_exit / recovery markers always pass through.
+        rec = ev.get("record")
+        if rec is not None and ev.get("kind") == "event":
+            key = (ev.get("log"), rec)
+            if not hasattr(self, "_seen_event_keys"):
+                self._seen_event_keys = set()
+            if key in self._seen_event_keys:
+                return
+            self._seen_event_keys.add(key)
         self.event_tree.insert("", 0, values=self._event_row_values(ev))
         children = self.event_tree.get_children()
         if len(children) > 200:
@@ -4254,22 +4637,33 @@ class App(tk.Tk):
                 self._real_close()
 
     def _real_close(self):
+        self.closing = True  # #19/#20: background workers check this and bail
         self.stop_event.set()
+        thread_dead = True
         if self.poll_thread:
-            # same worst-case reasoning as _toggle_logging's join: give the
-            # poll thread room to actually finish (a mid-ping iteration plus
-            # a PresentMon rotation) before closing the log file out from
-            # under it
-            self.poll_thread.join(timeout=4)
-        # stamp a clean-shutdown marker so the NEXT launch can tell a normal
-        # exit apart from a crash / hard-restart (see previous_session_status)
+            # #2/#3: wait for the poll thread to actually finish before we
+            # touch the log. Try longer than one interval, then confirm.
+            self.poll_thread.join(timeout=6)
+            thread_dead = not self.poll_thread.is_alive()
+        # #3: only write the CLEAN-shutdown marker if monitoring truly stopped.
+        # If the poll thread is wedged, writing "clean exit" would let the next
+        # launch wrongly conclude the session ended normally - so mark it as an
+        # unclean/forced close instead, which crash detection treats correctly.
         try:
-            self.log_manager.write({
-                "kind": "shutdown", "reason": "clean exit",
-                "ts": datetime.now().isoformat(timespec="seconds"),
-            })
+            if thread_dead:
+                self.log_manager.write({
+                    "kind": "shutdown", "reason": "clean exit",
+                    "ts": datetime.now().isoformat(timespec="seconds")})
+            else:
+                self.log_manager.write({
+                    "kind": "forced_close",
+                    "reason": "poll thread did not stop within timeout",
+                    "ts": datetime.now().isoformat(timespec="seconds")})
         except Exception:
             pass
+        # #2: closing the log races the poll thread only if it's still alive;
+        # LogManager's lock (#14) makes a late write safe either way, but we've
+        # already waited above.
         self.log_manager.close()
         if self._tray_icon is not None:
             try:
