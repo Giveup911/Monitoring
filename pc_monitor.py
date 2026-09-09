@@ -142,13 +142,143 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "1.7"
+APP_VERSION = "2.0"
+
+# The external watchdog is a PowerShell script CARRIED INSIDE this file and
+# written to disk at setup. It runs as a Scheduled Task independently of
+# Python, so it can update/relaunch the app even when Python itself is mid-
+# update or wedged. Cross-update: the watchdog keeps THIS .py current, and
+# the .py keeps the watchdog current - on launch the app compares the on-disk
+# watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
+# (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
+# WATCHDOG_PS1 changes so deployed copies refresh.
+WATCHDOG_VERSION = "3"
+WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
+# it is overwritten from the app's embedded copy on version change).
+$ErrorActionPreference = 'SilentlyContinue'
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$cfgPath = Join-Path $dir 'pcmonitor_config.json'
+if (-not (Test-Path $cfgPath)) { exit }
+try { $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch { exit }
+
+$script  = Join-Path $dir 'pc_monitor.py'
+$hb      = Join-Path $dir 'pcmonitor_heartbeat.json'
+$exitReq = Join-Path $dir 'pcmonitor_exit_request'
+$py  = if ($cfg.python_exe) { $cfg.python_exe } else { 'pythonw' }
+$pyc = if ($cfg.python_console_exe) { $cfg.python_console_exe } else { 'python' }
+$hook    = $cfg.discord_webhook_url
+$url     = $cfg.update_url
+$machine = if ($cfg.machine_label) { $cfg.machine_label } else { $env:COMPUTERNAME }
+$stale   = 180
+$stateFile = Join-Path $dir 'pcmonitor_watchdog_state.json'
+
+function Notify($msg) {
+  if (-not $hook) { return }
+  try {
+    $b = @{ content = $msg } | ConvertTo-Json -Compress
+    Invoke-RestMethod -Uri $hook -Method Post -Body $b -ContentType 'application/json' -TimeoutSec 15 | Out-Null
+  } catch {}
+}
+function VerTuple($v) { try { return ($v -split '\.' | ForEach-Object { [int]$_ }) } catch { return @(0) } }
+function VerGt($a, $b) {
+  $x = VerTuple $a; $y = VerTuple $b
+  $n = [Math]::Max($x.Count, $y.Count)
+  for ($i = 0; $i -lt $n; $i++) {
+    $xi = if ($i -lt $x.Count) { $x[$i] } else { 0 }
+    $yi = if ($i -lt $y.Count) { $y[$i] } else { 0 }
+    if ($xi -gt $yi) { return $true }
+    if ($xi -lt $yi) { return $false }
+  }
+  return $false
+}
+function AppRunning() {
+  if (-not (Test-Path $hb)) { return $false }
+  try {
+    $h = Get-Content $hb -Raw | ConvertFrom-Json
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $age = $now - [double]$h.ts
+    $proc = Get-Process -Id ([int]$h.pid) -ErrorAction SilentlyContinue
+    return (($proc -ne $null) -and ($age -lt $stale))
+  } catch { return $false }
+}
+function LaunchApp() {
+  try { Start-Process -FilePath $py -ArgumentList ('"' + $script + '"') -WindowStyle Hidden } catch {}
+}
+
+$updated = $false
+
+# 1) update: if the hosted APP_VERSION is newer, cleanly stop the app, replace
+# the file (validated with py_compile), relaunch, and notify.
+if ($url) {
+  try {
+    $remote = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10).Content
+    $rx = [regex]'APP_VERSION\s*=\s*"([0-9.]+)"'
+    $remoteVer = $rx.Match($remote).Groups[1].Value
+    $localVer = $rx.Match((Get-Content $script -Raw)).Groups[1].Value
+    if ($remoteVer -and $localVer -and (VerGt $remoteVer $localVer)) {
+      if (AppRunning) {
+        New-Item -Path $exitReq -ItemType File -Force | Out-Null
+        for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Seconds 1; if (-not (AppRunning)) { break } }
+        if (AppRunning) {
+          try { $h = Get-Content $hb -Raw | ConvertFrom-Json; Stop-Process -Id ([int]$h.pid) -Force } catch {}
+        }
+        Remove-Item $exitReq -Force -ErrorAction SilentlyContinue
+      }
+      $tmp = "$script.new"
+      [System.IO.File]::WriteAllText($tmp, $remote)
+      & $pyc -m py_compile $tmp 2>$null
+      if ($LASTEXITCODE -eq 0) {
+        Copy-Item $script "$script.bak" -Force -ErrorAction SilentlyContinue
+        Move-Item $tmp $script -Force
+        Notify ("PC Monitor updated " + $localVer + " -> " + $remoteVer + " on " + $machine + ". Restarting.")
+        LaunchApp
+        try { (@{ running = $true } | ConvertTo-Json -Compress) | Set-Content -Path $stateFile } catch {}
+        $updated = $true
+      } else {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+      }
+    }
+  } catch {}
+}
+
+# 2) lifecycle: detect running <-> stopped TRANSITIONS via a persisted state
+# file, so "stopped" fires exactly ONCE per stop (crash or clean close), not
+# every run. "running" is announced by the app itself on startup, so the
+# watchdog only records the running transition without re-notifying.
+if (-not $updated) {
+  $prevRunning = $false
+  try { if (Test-Path $stateFile) { $prevRunning = [bool]((Get-Content $stateFile -Raw | ConvertFrom-Json).running) } } catch {}
+  $nowRunning = AppRunning
+  if ($nowRunning -ne $prevRunning) {
+    if (-not $nowRunning) {
+      if (Test-Path $hb) {
+        Notify ("PC Monitor STOPPED on " + $machine + " (crash or task killed).")
+        Remove-Item $hb -Force -ErrorAction SilentlyContinue
+      } else {
+        Notify ("PC Monitor STOPPED on " + $machine + " (closed).")
+      }
+    }
+    try { (@{ running = $nowRunning } | ConvertTo-Json -Compress) | Set-Content -Path $stateFile } catch {}
+  }
+}
+'''
 
 # generic, unlabeled SuperIO sensors (unconnected motherboard headers that
 # read a fixed bogus value forever, e.g. a constant 104C phantom) - matched
 # so they can be kept in the raw log but excluded from decision logic
 _PHANTOM_SENSOR_RE = re.compile(r"(temperature|voltage|fan|current|power)\s*#?\s*\d+\s*$", re.I)
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "pcmonitor_config.json")
+
+# External-watchdog coordination files (all next to the script, so the
+# watchdog running the same file with --watchdog finds them):
+#  - heartbeat: main app stamps {pid, ts, version} here while alive, and
+#    DELETES it on a clean exit, so the watchdog can tell "running" from
+#    "crashed/killed" from "closed on purpose".
+#  - exit-request: the watchdog drops this to ask the running app to shut
+#    down cleanly (for an update) rather than being force-killed.
+HEARTBEAT_FILE = os.path.join(SCRIPT_DIR, "pcmonitor_heartbeat.json")
+EXIT_REQUEST_FILE = os.path.join(SCRIPT_DIR, "pcmonitor_exit_request")
+HEARTBEAT_STALE_SECONDS = 180  # heartbeat older than this => app is gone
 DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1.1",
                    "lhm_web_port": 8085, "setup_complete": False,
                    # auto-open LibreHardwareMonitor (with its web server) when
@@ -196,7 +326,16 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
                    "auto_update": True,
                    "update_url": "https://raw.githubusercontent.com/Giveup911/Monitoring/main/pc_monitor.py",
                    "update_check_interval_hours": 2,
-                   "auto_update_restart": True}
+                   "auto_update_restart": True,
+                   # external watchdog (a Scheduled Task running this same file
+                   # with --watchdog every few minutes). It owns updates (clean
+                   # stop + replace + restart, so the running script never
+                   # replaces itself) and detects crashes/kills to relaunch and
+                   # notify. Much more reliable than in-process self-update.
+                   "watchdog_enabled": True,
+                   "watchdog_interval_minutes": 10,
+                   "watchdog_autostart": True,    # relaunch the app if it's not running
+                   "auto_update_via_watchdog": True}  # main app skips in-process update
 
 
 def _load_config():
@@ -1377,6 +1516,19 @@ class PresentMonWatcher:
             self._priority_lowered = True
         out = {}
         try:
+            # #40: if the capture file shrank below our read cursor, it was
+            # truncated or replaced out from under us (e.g. PresentMon restarted
+            # itself, or an external tool cleared it). Re-read from the top and
+            # re-detect the header instead of seeking past the end and reading
+            # nothing forever.
+            try:
+                if os.path.getsize(self.csv_path) < self._pos:
+                    self._pos = 0
+                    self._header = None
+                    self._app_idx = None
+                    self._ft_idx = None
+            except OSError:
+                pass
             with open(self.csv_path, "rb") as f:
                 f.seek(self._pos)
                 chunk = f.read()
@@ -2163,7 +2315,7 @@ class LogManager:
             path = f"{base}_{n}.jsonl"
             n += 1
         self._path = path
-        self._fh = open(self._path, "a", buffering=1, encoding="utf-8")  # #62
+        self._fh = open(self._path, "a", buffering=1, encoding="utf-8", newline="")  # #62/#63
         self._size = 0
 
     def write(self, row: dict):
@@ -2173,6 +2325,12 @@ class LogManager:
             try:
                 if self._size and self._size + b > self.max_file_bytes:
                     self._open_new_file()
+                # #15: a single row bigger than the whole per-file cap still
+                # gets written (splitting telemetry would corrupt it), but note
+                # it so the oversize is visible rather than silently breaking
+                # the "max file size" guarantee.
+                if b > self.max_file_bytes:
+                    self._oversized_rows = getattr(self, "_oversized_rows", 0) + 1
                 self._fh.write(line)
                 self._fh.flush()
                 os.fsync(self._fh.fileno())
@@ -2228,6 +2386,7 @@ class LogManager:
         with self._lock:
             return {"healthy": self.healthy, "last_error": self.last_error,
                     "consecutive_failures": self.consecutive_failures,
+                    "oversized_rows": getattr(self, "_oversized_rows", 0),
                     "seconds_since_ok": round(time.time() - self.last_ok_time, 1)}
 
     def current_path(self):
@@ -2976,6 +3135,7 @@ class PollThread(threading.Thread):
         # process (foreground stayed on the desktop), so tracking foreground
         # alone would have missed it; track the heavy hitters instead.
         prev_heavy = {}
+        last_heartbeat = 0.0            # throttle heartbeat writes (~15s)
 
         # --- adaptive sampling state ---
         adaptive = bool(CONFIG.get("adaptive_poll", True))
@@ -3002,6 +3162,8 @@ class PollThread(threading.Thread):
         recovery_enabled = bool(CONFIG.get("gpu_stall_recovery", False))
         GPU_RECENT_ACTIVE_S = 30.0
         last_poll_wall = None           # for real inter-sample dt
+        prev_interval = 5.0             # #67: interval the last sleep actually used
+        poll_error_streak = 0           # #32: consecutive failed polls
 
         # --- session inventory header (once, first thing) ---
         try:
@@ -3030,6 +3192,27 @@ class PollThread(threading.Thread):
                     base_interval = 5.0
                 next_interval = base_interval
                 try:
+                    # watchdog coordination: honour a clean-exit request (the
+                    # watchdog asks for this before an update instead of killing
+                    # us), and stamp a heartbeat so the watchdog can tell we're
+                    # alive vs crashed/killed.
+                    if os.path.exists(EXIT_REQUEST_FILE):
+                        try:
+                            os.remove(EXIT_REQUEST_FILE)
+                        except OSError:
+                            pass
+                        self._put({"kind": "exit_request"})  # GUI does a clean close
+                        break
+                    now_hb = time.monotonic()
+                    if now_hb - last_heartbeat >= 15:
+                        last_heartbeat = now_hb
+                        try:
+                            with open(HEARTBEAT_FILE, "w", encoding="utf-8") as hf:
+                                json.dump({"pid": os.getpid(), "ts": time.time(),
+                                           "version": APP_VERSION}, hf)
+                        except Exception:
+                            pass
+
                     if not reader.connected:
                         # #34: retry on a wall-clock cadence (~30s), not a loop
                         # count - loop count means wildly different real spacing
@@ -3047,6 +3230,7 @@ class PollThread(threading.Thread):
                         # (or the whole machine) was starved - itself a crash
                         # precursor seen in real captures right before a freeze.
                         row["dt"] = round(now_wall - last_poll_wall, 2)
+                        row["expected_interval"] = round(prev_interval, 2)  # #67
                     last_poll_wall = now_wall
                     row.update(read_system_stats(proc_monitor, net_monitor,
                                                    cached_cpu_counts, cached_boot_time))
@@ -3259,19 +3443,24 @@ class PollThread(threading.Thread):
                                 recent_event_until = time.monotonic() + 15  # #51 monotonic
                         except Exception:
                             pass
+                    row["poll_ok"] = True  # reached the end of a poll without error
+                    poll_error_streak = 0
                 except Exception as e:
                     # Something genuinely unexpected broke this poll (e.g.
                     # psutil itself misbehaving). Surface it instead of
                     # letting the whole thread die silently - especially
                     # important since the installed app runs via
                     # pythonw.exe with no console to print a traceback to.
+                    poll_error_streak += 1
                     perr = {
                         "kind": "poll_error", "error": f"{type(e).__name__}: {e}",
+                        "consecutive": poll_error_streak,  # #32: expose repeated failures
                         "ts": datetime.now().isoformat(timespec="seconds"),
                     }
                     self._log(perr)   # persist to disk, not just the GUI queue
                     self._put(perr)
 
+                prev_interval = next_interval   # #67: remember for next dt comparison
                 self.stop_event.wait(next_interval)
         finally:
             presentmon.stop()
@@ -3321,7 +3510,7 @@ class Card(tk.Frame):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PC Monitor")
+        self.title(f"PC Monitor  v{APP_VERSION}")
         self.configure(bg=BG)
         self.geometry("1180x720")
         self.minsize(980, 620)
@@ -3353,7 +3542,30 @@ class App(tk.Tk):
         if CONFIG.get("auto_launch_lhm", True):
             threading.Thread(target=self._autostart_lhm_worker, daemon=True).start()
 
+        # Cross-update: if the watchdog just pulled a newer .py, that .py may
+        # carry a newer embedded watchdog - redeploy it. Background so it never
+        # delays the window.
+        threading.Thread(
+            target=lambda: sync_watchdog(SCRIPT_DIR, os.path.abspath(__file__)),
+            daemon=True).start()
+
+        # lifecycle: announce we're up (PC restart, or relaunched after being
+        # closed/updated). The app sends "running" itself because it's alive
+        # and can; the watchdog owns "stopped" (a crashed app can't report its
+        # own death). Background so it never blocks the window.
+        threading.Thread(target=self._notify_running, daemon=True).start()
+
         self._check_previous_session()
+
+    def _notify_running(self):
+        hook = (CONFIG.get("discord_webhook_url") or "").strip()
+        if not hook:
+            return
+        try:
+            post_crash_to_discord(
+                hook, f"PC Monitor v{APP_VERSION} running on `{_machine_label()}`.", [])
+        except Exception:
+            pass
 
     def _check_previous_session(self):
         """If the last session didn't end cleanly, kick off crash handling
@@ -4221,6 +4433,10 @@ class App(tk.Tk):
                     poll_error = item
                 elif kind == "session_start":
                     session_inv = item
+                elif kind == "exit_request":
+                    # watchdog asked us to shut down cleanly (for an update)
+                    self._real_close()
+                    return
                 elif kind in ("shutdown", "forced_close", "log_error"):
                     pass  # markers with no live-UI meaning (already on disk)
                 else:
@@ -4241,9 +4457,10 @@ class App(tk.Tk):
                      f"({latest_metrics.get('log_error')}). Crash evidence is NOT "
                      "being saved - check disk space / the logs drive.")
         if poll_error:
+            streak = poll_error.get("consecutive", 1)
+            extra = f" ({streak} in a row - polling may be persistently broken)" if streak >= 3 else ""
             self.error_lbl.config(
-                text=f"Polling hit an error at {poll_error['ts']} (still running, "
-                     f"will keep retrying): {poll_error['error']}")
+                text=f"Polling hit an error at {poll_error['ts']}{extra}: {poll_error['error']}")
         # reschedule sooner if we hit the cap (backlog remains)
         self.after(200 if drained >= 800 else 1000, self._pump_queue)
 
@@ -4252,7 +4469,9 @@ class App(tk.Tk):
         status area so the driver version is visible at a glance."""
         if not inv:
             return
-        bits = []
+        bits = [f"PC Monitor v{inv.get('app_version', APP_VERSION)}"]
+        if inv.get("machine"):
+            bits.append(str(inv["machine"]))
         if inv.get("gpu"):
             bits.append(inv["gpu"] + (f" (driver {inv['gpu_driver']})"
                                       if inv.get("gpu_driver") else ""))
@@ -4665,6 +4884,12 @@ class App(tk.Tk):
         # LogManager's lock (#14) makes a late write safe either way, but we've
         # already waited above.
         self.log_manager.close()
+        # remove the heartbeat so the watchdog sees a CLEAN exit (no relaunch,
+        # no crash webhook) rather than mistaking this for a crash/kill.
+        try:
+            os.remove(HEARTBEAT_FILE)
+        except OSError:
+            pass
         if self._tray_icon is not None:
             try:
                 self._tray_icon.stop()
@@ -4891,15 +5116,55 @@ def install_clone(logs_dir, extra_config=None):
     with open(SOURCE_APP, "rb") as src, open(clone_path, "wb") as dst:
         dst.write(src.read())
 
-    cfg = {"logs_dir": logs_dir, "setup_complete": True}
+    # Write the FULL effective config to the clone, not just a couple keys -
+    # the PowerShell watchdog reads this JSON directly and needs update_url,
+    # discord_webhook_url, machine_label, etc. (it can't see Python's
+    # in-memory DEFAULT_CONFIG).
+    cfg = dict(CONFIG)
+    cfg["logs_dir"] = logs_dir
+    cfg["setup_complete"] = True
     if extra_config:
         cfg.update(extra_config)
-    with open(os.path.join(start_menu, "pcmonitor_config.json"), "w") as f:
+    with open(os.path.join(start_menu, "pcmonitor_config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
     print(f"Installed to: {clone_path}")
     print("It'll already show up if you search \"PC Monitor\" in the Start Menu.")
+    # deploy the PowerShell watchdog next to the clone + register its task
+    if CONFIG.get("watchdog_enabled", True):
+        try:
+            if deploy_watchdog(start_menu, clone_path):
+                print("Watchdog deployed (PowerShell; on login + every "
+                      f"{CONFIG.get('watchdog_interval_minutes', 10)} min).")
+        except Exception:
+            pass
+    # #5: start the main app on login via a Startup-folder shortcut (the
+    # watchdog does NOT start it - only relaunches after an update)
+    if create_startup_shortcut(clone_path):
+        print("Added to Startup - it'll launch automatically when you log in.")
     return clone_path
+
+
+def create_startup_shortcut(clone_path):
+    """#5: put a shortcut to the app in the user's Startup folder so it
+    launches on login. This - not the watchdog - is what starts the main app
+    at boot (the watchdog only relaunches after an update). Best-effort."""
+    try:
+        import win32com.client
+        startup = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows",
+                                "Start Menu", "Programs", "Startup")
+        os.makedirs(startup, exist_ok=True)
+        pythonw = find_pythonw()
+        shell = win32com.client.Dispatch("WScript.Shell")
+        sc = shell.CreateShortCut(os.path.join(startup, "PC Monitor.lnk"))
+        sc.Targetpath = pythonw
+        sc.Arguments = f'"{clone_path}"'
+        sc.WorkingDirectory = os.path.dirname(clone_path)
+        sc.IconLocation = pythonw
+        sc.save()
+        return True
+    except Exception:
+        return False
 
 
 def create_shortcut(clone_path):
@@ -5156,9 +5421,15 @@ def check_and_apply_update():
 def _maybe_self_update():
     """Run at the very top of launch: apply an update if available and,
     unless disabled, relaunch into the new version so it takes effect
-    immediately. The --no-update arg on the relaunch prevents any loop."""
+    immediately. The --no-update arg on the relaunch prevents any loop.
+
+    Skipped entirely when the external watchdog owns updates - having both
+    the running app AND the watchdog try to replace the file is exactly the
+    fragile self-replacement this architecture moved away from."""
     if "--no-update" in sys.argv:
         return
+    if CONFIG.get("auto_update_via_watchdog", True) and CONFIG.get("watchdog_enabled", True):
+        return  # the --watchdog Scheduled Task handles updates (clean stop/restart)
     try:
         newv = check_and_apply_update()
     except Exception:
@@ -5168,12 +5439,328 @@ def _maybe_self_update():
     if not CONFIG.get("auto_update_restart", True):
         return  # applied; will run on next launch
     try:
-        # relaunch with the same interpreter/args; child inherits elevation
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--no-update"]
                          + [a for a in sys.argv[1:] if a != "--no-update"])
     except Exception:
-        return  # couldn't relaunch - the update still applies next launch
+        return
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# External watchdog: run by a Scheduled Task as `pc_monitor.py --watchdog`
+# every few minutes. It OWNS updates (clean stop + replace + restart, so the
+# live app never rewrites itself) and detects crashes/kills to relaunch and
+# notify. Short-lived: check, act, exit.
+# ---------------------------------------------------------------------------
+_SINGLE_INSTANCE_HANDLE = None
+
+
+def ensure_single_instance():
+    """#7: prevent overlapping copies of the app (Startup shortcut + a manual
+    launch + an update relaunch could all try). A named mutex is the gate:
+    - nobody holds it -> we're the sole instance, proceed.
+    - a HEALTHY instance holds it (fresh heartbeat + live pid) -> we exit
+      quietly so there's no duplicate window.
+    - a STALE/zombie holder (hung, dead pid) -> terminate it and take over,
+      so a wedged leftover can never block a fresh start.
+    Returns True if we may run, False if the caller should exit. Windows-only;
+    fails open (returns True) if the mutex API isn't available."""
+    global _SINGLE_INSTANCE_HANDLE
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        h = k.CreateMutexW(None, False, "Local\\PCMonitorMainInstance")
+        if h and k.GetLastError() == ERROR_ALREADY_EXISTS:
+            running, hb = _app_running()
+            if running:
+                return False  # a healthy instance already runs
+            if hb and psutil:  # stale/zombie holder -> take over
+                try:
+                    psutil.Process(int(hb.get("pid"))).terminate()
+                except Exception:
+                    pass
+        _SINGLE_INSTANCE_HANDLE = h  # keep the handle alive for our lifetime
+        return True
+    except Exception:
+        return True  # fail open - better to run than to wrongly block
+
+
+def _machine_label():
+    lbl = (CONFIG.get("machine_label") or "").strip()
+    if lbl:
+        return lbl
+    try:
+        import socket
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
+
+
+def _read_heartbeat():
+    try:
+        with open(HEARTBEAT_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _app_running():
+    """(running_bool, heartbeat) - is a PC Monitor MAIN instance alive?"""
+    hb = _read_heartbeat()
+    if not hb:
+        return False, None
+    try:
+        pid = int(hb.get("pid", -1))
+        fresh = (time.time() - float(hb.get("ts", 0))) <= HEARTBEAT_STALE_SECONDS
+        alive = psutil.pid_exists(pid) if psutil else True
+        return (fresh and alive), hb
+    except Exception:
+        return False, hb
+
+
+def _launch_main_app():
+    """Spawn the normal (GUI) instance of this same file, detached so it
+    outlives the short-lived watchdog process."""
+    try:
+        target = os.path.abspath(__file__)
+        py = find_pythonw() or sys.executable
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        subprocess.Popen([py, target], creationflags=flags, close_fds=True)
+        return True
+    except Exception:
+        return False
+
+
+def _watchdog_notify(content):
+    hook = (CONFIG.get("discord_webhook_url") or "").strip()
+    if not hook:
+        return
+    try:
+        post_crash_to_discord(hook, content, [])
+    except Exception:
+        pass
+
+
+def _write_update_marker(old_v, new_v):
+    """Record the update in a dedicated file in the logs dir (not the active
+    session log, to avoid racing the running app), so the trail shows it."""
+    try:
+        p = os.path.join(LOGS_DIR, "pcmonitor_updates.log")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
+                                "event": "update", "from": old_v, "to": new_v,
+                                "machine": _machine_label()}) + "\n")
+    except Exception:
+        pass
+
+
+def _watchdog_update():
+    """Check update_url; if newer, cleanly stop the running app, replace the
+    file, relaunch, and notify. Returns the new version or None."""
+    if not CONFIG.get("auto_update", True):
+        return None
+    url = (CONFIG.get("update_url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "PCMonitorWatchdog/%s" % APP_VERSION})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            remote = r.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    m = re.search(r'APP_VERSION\s*=\s*["\']([\d.]+)["\']', remote)
+    if not m or _version_tuple(m.group(1)) <= _version_tuple(APP_VERSION):
+        return None
+    remote_ver = m.group(1)
+    # ask the running app to close cleanly, then wait for it to actually go
+    running, hb = _app_running()
+    if running:
+        try:
+            open(EXIT_REQUEST_FILE, "w").close()
+        except OSError:
+            pass
+        for _ in range(20):
+            time.sleep(1)
+            if not _app_running()[0]:
+                break
+        running2, hb2 = _app_running()
+        if running2 and hb2 and psutil:  # ignored the request -> force it
+            try:
+                psutil.Process(int(hb2.get("pid"))).terminate()
+            except Exception:
+                pass
+        try:
+            os.remove(EXIT_REQUEST_FILE)
+        except OSError:
+            pass
+    # replace the file (validated + backed up, same rules as check_and_apply_update)
+    target = os.path.abspath(__file__)
+    tmp = target + ".new"
+    try:
+        import py_compile
+        import shutil
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(remote)
+        py_compile.compile(tmp, doraise=True)
+        try:
+            shutil.copy2(target, target + ".bak")
+        except Exception:
+            pass
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return None
+    _write_update_marker(APP_VERSION, remote_ver)
+    _watchdog_notify(f"PC Monitor updated {APP_VERSION} -> {remote_ver} on `{_machine_label()}`. Restarting.")
+    _launch_main_app()
+    return remote_ver
+
+
+def run_watchdog():
+    try:
+        if _watchdog_update():
+            return  # updated + relaunched; done this run
+    except Exception:
+        pass
+    try:
+        state_file = os.path.join(SCRIPT_DIR, "pcmonitor_watchdog_state.json")
+        prev_running = False
+        try:
+            with open(state_file, encoding="utf-8") as f:
+                prev_running = bool(json.load(f).get("running"))
+        except Exception:
+            prev_running = False
+        now_running, hb = _app_running()
+        if now_running != prev_running:
+            if not now_running:
+                # running -> stopped (crash/kill if heartbeat lingered, else clean)
+                if os.path.exists(HEARTBEAT_FILE):
+                    _watchdog_notify(f"PC Monitor STOPPED on `{_machine_label()}` (crash or task killed).")
+                    try:
+                        os.remove(HEARTBEAT_FILE)
+                    except OSError:
+                        pass
+                else:
+                    _watchdog_notify(f"PC Monitor STOPPED on `{_machine_label()}` (closed).")
+            try:
+                _atomic_write_json(state_file, {"running": now_running})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _watchdog_paths(script_dir):
+    return (os.path.join(script_dir, "pcmonitor_watchdog.ps1"),
+            os.path.join(script_dir, "pcmonitor_watchdog.ver"),
+            os.path.join(script_dir, "pcmonitor_config.json"))
+
+
+def deploy_watchdog(script_dir, script_path=None):
+    """Write the embedded PowerShell watchdog to disk next to the script,
+    make sure the config it reads has the interpreter paths, and register
+    the Scheduled Task to run it. This is the '.py deploys the watchdog'
+    half of the cross-update."""
+    if not CONFIG.get("watchdog_enabled", True):
+        return False
+    ps1_path, ver_path, cfg_path = _watchdog_paths(script_dir)
+    try:
+        # ensure the config the PS reads has what it needs (the PS can't see
+        # Python's in-memory DEFAULT_CONFIG, only the JSON file)
+        try:
+            cfg = {}
+            if os.path.exists(cfg_path):
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        merged = dict(CONFIG)
+        merged.update(cfg)  # file wins for anything already set there
+        merged["python_exe"] = find_pythonw() or sys.executable
+        merged["python_console_exe"] = _find_console_python()
+        _atomic_write_json(cfg_path, merged)
+        # write the watchdog + its version stamp
+        with open(ps1_path, "w", encoding="utf-8") as f:
+            f.write(WATCHDOG_PS1)
+        with open(ver_path, "w", encoding="utf-8") as f:
+            f.write(WATCHDOG_VERSION)
+        # register the task to run the PS watchdog (independent of Python).
+        # Two triggers: every N minutes AND at logon, so the (lightweight)
+        # watchdog is present right after login without waiting a full cycle.
+        interval = max(1, int(CONFIG.get("watchdog_interval_minutes", 10)))
+        tr = ('powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+              '-File "%s"' % ps1_path)
+        subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdog",
+                        "/TR", tr, "/SC", "MINUTE", "/MO", str(interval), "/F"],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+        subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdogLogon",
+                        "/TR", tr, "/SC", "ONLOGON", "/F"],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+        return True
+    except Exception:
+        return False
+
+
+def _find_console_python():
+    """A console python.exe (for the watchdog's py_compile validation, which
+    needs an exit code) - derive it from the windowed interpreter."""
+    exe = sys.executable or ""
+    if exe.lower().endswith("pythonw.exe"):
+        cand = exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.exists(cand):
+            return cand
+    if exe.lower().endswith("python.exe"):
+        return exe
+    pw = find_pythonw() or ""
+    if pw.lower().endswith("pythonw.exe"):
+        cand = pw[:-len("pythonw.exe")] + "python.exe"
+        if os.path.exists(cand):
+            return cand
+    return "python"
+
+
+def sync_watchdog(script_dir, script_path=None):
+    """The '.py keeps the watchdog current' half of the cross-update: if the
+    on-disk watchdog is missing or older than this file's embedded
+    WATCHDOG_VERSION (because the watchdog just pulled a newer .py), rewrite
+    and re-register it. Cheap file check; safe to call on every launch."""
+    if not CONFIG.get("watchdog_enabled", True):
+        return
+    ps1_path, ver_path, _ = _watchdog_paths(script_dir)
+    try:
+        on_disk = None
+        if os.path.exists(ver_path):
+            with open(ver_path, encoding="utf-8") as f:
+                on_disk = f.read().strip()
+        if (not os.path.exists(ps1_path)) or on_disk != WATCHDOG_VERSION:
+            deploy_watchdog(script_dir, script_path)
+    except Exception:
+        pass
+
+
+def register_watchdog_task(script_path=None):
+    """Create/refresh the Scheduled Task that runs the watchdog every N min.
+    Points at script_path (the persistent Start Menu clone), not necessarily
+    the file currently executing."""
+    if not CONFIG.get("watchdog_enabled", True):
+        return False
+    try:
+        py = find_pythonw() or sys.executable
+        target = os.path.abspath(script_path or __file__)
+        interval = max(1, int(CONFIG.get("watchdog_interval_minutes", 10)))
+        tr = f'"{py}" "{target}" --watchdog'
+        subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdog",
+                        "/TR", tr, "/SC", "MINUTE", "/MO", str(interval), "/F"],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+        return True
+    except Exception:
+        return False
 
 
 def _crash_log_path():
@@ -5214,6 +5801,10 @@ def _run_gui_guarded():
     main loop) is written to pc_monitor_crash.log and shown in a dialog,
     so 'it just closes' becomes something you can actually read."""
     import traceback
+    # #7: bow out if a healthy instance is already running (or take over a
+    # stale one). Done here so it covers every GUI launch path.
+    if not ensure_single_instance():
+        sys.exit(0)
     try:
         app = App()
     except Exception:
@@ -5245,9 +5836,17 @@ def _run_gui_guarded():
 
 
 if __name__ == "__main__":
-    # Self-update FIRST, before anything else: if a newer version is hosted,
-    # replace this file and relaunch into it. So you host one copy and every
-    # friend's copy keeps itself current - no more re-sending files.
+    # --watchdog: run by the Scheduled Task. Do the watchdog work (update
+    # check + crash/kill detection + relaunch) and exit; never open the GUI.
+    if "--watchdog" in sys.argv:
+        try:
+            run_watchdog()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    # Self-update: only used as a fallback when the external watchdog isn't
+    # handling updates (see _maybe_self_update - it no-ops under the watchdog).
     _maybe_self_update()
 
     force_install = len(sys.argv) > 1 and sys.argv[1] in ("install", "--install", "-install")
