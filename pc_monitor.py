@@ -142,7 +142,7 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "2.2"
+APP_VERSION = "1.7"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -3944,6 +3944,8 @@ class App(tk.Tk):
                     command=self._hide_lhm_window).pack(side="left", padx=12)
         ttk.Button(controls2, text="Export Diagnostics (zip)",
                     command=self._export_diagnostics).pack(side="left", padx=6)
+        ttk.Button(controls2, text="Repair Watchdog",
+                    command=self._repair_watchdog).pack(side="left", padx=6)
         ttk.Button(controls2, text="Re-run Setup...",
                     command=self._rerun_installer).pack(side="right", padx=6)
 
@@ -4810,6 +4812,43 @@ class App(tk.Tk):
                 else:
                     messagebox.showerror("Export Diagnostics",
                                           "Couldn't build the diagnostics zip.")
+            self.after(0, done)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _repair_watchdog(self):
+        """Force a clean redeploy of the watchdog (new headless launcher +
+        re-registered tasks) and report what's actually deployed - so a stuck
+        auto-update chain can be fixed with one click instead of a reinstall."""
+        def worker():
+            ok = deploy_watchdog(SCRIPT_DIR, os.path.abspath(__file__))
+            # read back what's on disk / registered so the user can verify
+            ver = "(none)"
+            try:
+                _, ver_path, _ = _watchdog_paths(SCRIPT_DIR)
+                if os.path.exists(ver_path):
+                    ver = open(ver_path, encoding="utf-8").read().strip()
+            except Exception:
+                pass
+            task = "unknown"
+            try:
+                r = subprocess.run(["schtasks", "/Query", "/TN", "PCMonitorWatchdog", "/V", "/FO", "LIST"],
+                                   capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+                task = "registered" if r.returncode == 0 else "NOT registered"
+            except Exception:
+                pass
+            hook = "set" if (CONFIG.get("discord_webhook_url") or "").strip() else "MISSING"
+            url = (CONFIG.get("update_url") or "").strip() or "MISSING"
+            def done():
+                (messagebox.showinfo if ok else messagebox.showwarning)(
+                    "Repair Watchdog",
+                    f"Redeploy: {'OK' if ok else 'FAILED'}\n"
+                    f"Deployed watchdog version: {ver} (this app expects {WATCHDOG_VERSION})\n"
+                    f"Scheduled task: {task}\n"
+                    f"Webhook: {hook}\n"
+                    f"Update URL: {url}\n\n"
+                    f"Folder: {SCRIPT_DIR}\n"
+                    "If PowerShell still flashes, delete any extra PCMonitor* tasks "
+                    "in Task Scheduler - an old one may still run powershell directly.")
             self.after(0, done)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5705,11 +5744,10 @@ def deploy_watchdog(script_dir, script_path=None):
             f.write(WATCHDOG_VERSION)
         # register the task to run the watchdog THROUGH wscript.exe (no console
         # window at all), so it never flashes a PowerShell window every cycle.
-        # Two triggers: every N minutes AND at logon.
-        wscript = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
-                               "System32", "wscript.exe")
+        # wscript is on the system PATH; quoting only the .vbs path avoids the
+        # nested-quote issues that can make a scheduled task silently not run.
         interval = max(1, int(CONFIG.get("watchdog_interval_minutes", 10)))
-        tr = '"%s" "%s"' % (wscript, vbs_path)
+        tr = 'wscript "%s"' % vbs_path
         subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdog",
                         "/TR", tr, "/SC", "MINUTE", "/MO", str(interval), "/F"],
                        capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
@@ -5740,10 +5778,22 @@ def _find_console_python():
 
 
 def sync_watchdog(script_dir, script_path=None):
-    """The '.py keeps the watchdog current' half of the cross-update: if the
-    on-disk watchdog is missing or older than this file's embedded
-    WATCHDOG_VERSION (because the watchdog just pulled a newer .py), rewrite
-    and re-register it. Cheap file check; safe to call on every launch."""
+    """Self-healing: on EVERY app startup, rewrite the watchdog (.ps1 + .vbs)
+    from this file's embedded copy and re-register its Scheduled Task. No
+    version-compare gate - that was the bug: if the compare matched (or got
+    stuck) the watchdog never refreshed, so 'main updated but the watchdog
+    didn't'. The app only starts after an update relaunch (or at login), so
+    always-rewriting GUARANTEES the on-disk watchdog + task match whatever
+    .py is now running. Cheap: two small file writes + an idempotent
+    schtasks /F. deploy_watchdog is a no-op if watchdog_enabled is false."""
+    try:
+        deploy_watchdog(script_dir, script_path)
+    except Exception:
+        pass
+
+
+def _legacy_sync_watchdog_unused(script_dir, script_path=None):
+    # kept for reference (the old version-gated behaviour that could get stuck)
     if not CONFIG.get("watchdog_enabled", True):
         return
     ps1_path, ver_path, _ = _watchdog_paths(script_dir)
