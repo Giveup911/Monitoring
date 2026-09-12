@@ -142,7 +142,7 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "2.0"
+APP_VERSION = "1.6"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -152,7 +152,7 @@ APP_VERSION = "2.0"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "3"
+WATCHDOG_VERSION = "4"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
 # it is overwritten from the app's embedded copy on version change).
 $ErrorActionPreference = 'SilentlyContinue'
@@ -226,8 +226,8 @@ if ($url) {
       }
       $tmp = "$script.new"
       [System.IO.File]::WriteAllText($tmp, $remote)
-      & $pyc -m py_compile $tmp 2>$null
-      if ($LASTEXITCODE -eq 0) {
+      $pc = Start-Process -FilePath $pyc -ArgumentList @('-m','py_compile', $tmp) -WindowStyle Hidden -Wait -PassThru
+      if ($pc.ExitCode -eq 0) {
         Copy-Item $script "$script.bak" -Force -ErrorAction SilentlyContinue
         Move-Item $tmp $script -Force
         Notify ("PC Monitor updated " + $localVer + " -> " + $remoteVer + " on " + $machine + ". Restarting.")
@@ -263,6 +263,16 @@ if (-not $updated) {
 }
 '''
 
+# A windowless VBScript launcher for the watchdog. The Scheduled Task runs
+# this via wscript.exe (which has NO console), and it launches PowerShell with
+# window style 0 (fully hidden) - so the watchdog never flashes a window every
+# few minutes. Self-locating: runs the .ps1 sitting next to it.
+WATCHDOG_VBS = r'''Dim sh, fso, dir
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+dir = fso.GetParentFolderName(WScript.ScriptFullName)
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & dir & "\pcmonitor_watchdog.ps1""", 0, False
+'''
 # generic, unlabeled SuperIO sensors (unconnected motherboard headers that
 # read a fixed bogus value forever, e.g. a constant 104C phantom) - matched
 # so they can be kept in the raw log but excluded from decision logic
@@ -5685,17 +5695,21 @@ def deploy_watchdog(script_dir, script_path=None):
         merged["python_exe"] = find_pythonw() or sys.executable
         merged["python_console_exe"] = _find_console_python()
         _atomic_write_json(cfg_path, merged)
-        # write the watchdog + its version stamp
+        # write the watchdog + a windowless VBScript launcher + version stamp
         with open(ps1_path, "w", encoding="utf-8") as f:
             f.write(WATCHDOG_PS1)
+        vbs_path = os.path.join(script_dir, "pcmonitor_watchdog_launch.vbs")
+        with open(vbs_path, "w", encoding="utf-8") as f:
+            f.write(WATCHDOG_VBS)
         with open(ver_path, "w", encoding="utf-8") as f:
             f.write(WATCHDOG_VERSION)
-        # register the task to run the PS watchdog (independent of Python).
-        # Two triggers: every N minutes AND at logon, so the (lightweight)
-        # watchdog is present right after login without waiting a full cycle.
+        # register the task to run the watchdog THROUGH wscript.exe (no console
+        # window at all), so it never flashes a PowerShell window every cycle.
+        # Two triggers: every N minutes AND at logon.
+        wscript = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                               "System32", "wscript.exe")
         interval = max(1, int(CONFIG.get("watchdog_interval_minutes", 10)))
-        tr = ('powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
-              '-File "%s"' % ps1_path)
+        tr = '"%s" "%s"' % (wscript, vbs_path)
         subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdog",
                         "/TR", tr, "/SC", "MINUTE", "/MO", str(interval), "/F"],
                        capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
