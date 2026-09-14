@@ -145,7 +145,7 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -155,7 +155,7 @@ APP_VERSION = "2.8"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "11"
+WATCHDOG_VERSION = "12"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
 # it is overwritten from the app's embedded copy whenever this app deploys.
 $ErrorActionPreference = 'SilentlyContinue'
@@ -355,7 +355,7 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
                    "update_check_interval_hours": 1 / 60,
                    "auto_update_restart": True,
                    # external watchdog (a Scheduled Task running this same file
-                   # with --watchdog every few minutes). It owns updates (clean
+                   # with --watchdog every 1 minute). It owns updates (clean
                    # stop + replace + restart, so the running script never
                    # replaces itself) and detects crashes/kills to relaunch and
                    # notify. Much more reliable than in-process self-update.
@@ -5799,12 +5799,38 @@ def deploy_watchdog(script_dir, script_path=None):
         # nested-quote issues that can make a scheduled task silently not run.
         interval = 1
         tr = 'wscript "%s"' % vbs_path
-        subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdog",
-                        "/TR", tr, "/SC", "MINUTE", "/MO", str(interval), "/F"],
-                       capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
-        subprocess.run(["schtasks", "/Create", "/TN", "PCMonitorWatchdogLogon",
-                        "/TR", tr, "/SC", "ONLOGON", "/F"],
-                       capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+
+        # Do NOT ignore schtasks failures.  The old code returned True even
+        # when Windows rejected the task (for example because an older task
+        # had a bad action/security context).  That made the GUI say the
+        # watchdog was installed when nothing would actually run.
+        def _create_task(name, schedule, extra=None):
+            cmd = ["schtasks", "/Create", "/TN", name, "/TR", tr,
+                   "/SC", schedule, "/F"]
+            if schedule == "MINUTE":
+                cmd += ["/MO", str(interval)]
+            if extra:
+                cmd += extra
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               creationflags=CREATE_NO_WINDOW, timeout=15)
+            out = ((r.stdout or "") + " " + (r.stderr or "")).strip()
+            _remote_log(f"WATCHDOG TASK {name} rc={r.returncode} output={out!r}")
+            if r.returncode != 0:
+                raise RuntimeError(f"schtasks failed for {name}: {out or 'no output'}")
+
+        _create_task("PCMonitorWatchdog", "MINUTE")
+        _create_task("PCMonitorWatchdogLogon", "ONLOGON")
+
+        # Verify that Windows actually registered the primary task and that
+        # its action points at the launcher we just wrote.  This catches
+        # quoting/path problems that /Create can otherwise leave ambiguous.
+        verify = subprocess.run(
+            ["schtasks", "/Query", "/TN", "PCMonitorWatchdog", "/V", "/FO", "LIST"],
+            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+        if verify.returncode != 0:
+            raise RuntimeError("PCMonitorWatchdog was not registered")
+        if os.path.normcase(vbs_path) not in os.path.normcase(verify.stdout or ""):
+            _remote_log("WATCHDOG TASK verification warning: expected VBS path was not visible in task query")
         return True
     except Exception:
         return False
@@ -5860,7 +5886,7 @@ def _legacy_sync_watchdog_unused(script_dir, script_path=None):
 
 
 def register_watchdog_task(script_path=None):
-    """Create/refresh the Scheduled Task that runs the watchdog every N min.
+    """Create/refresh the Scheduled Task that runs the watchdog every 1 minute.
     Points at script_path (the persistent Start Menu clone), not necessarily
     the file currently executing."""
     if not CONFIG.get("watchdog_enabled", True):
