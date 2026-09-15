@@ -173,7 +173,7 @@ APP_VERSION = "3.6"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "20"
+WATCHDOG_VERSION = "21"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
 # it is overwritten from the app's embedded copy whenever this app deploys.
 $ErrorActionPreference = 'SilentlyContinue'
@@ -6418,8 +6418,13 @@ def deploy_watchdog(script_dir, script_path=None):
         # had a bad action/security context).  That made the GUI say the
         # watchdog was installed when nothing would actually run.
         def _create_task(name, schedule, extra=None):
+            # /RL HIGHEST: run elevated. The app lives under ProgramData
+            # (created by the elevated installer); a normal-integrity task
+            # can't overwrite it, so the update's Move-Item over pc_monitor.py
+            # would silently fail - "updates never push". Scheduled tasks with
+            # highest privileges run elevated with NO UAC prompt.
             cmd = ["schtasks", "/Create", "/TN", name, "/TR", tr,
-                   "/SC", schedule, "/F"]
+                   "/SC", schedule, "/RL", "HIGHEST", "/F"]
             if schedule == "MINUTE":
                 cmd += ["/MO", str(interval)]
             if extra:
