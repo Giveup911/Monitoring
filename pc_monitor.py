@@ -163,7 +163,7 @@ APP_EXPORTS_DIR = os.path.join(APP_DATA_DIR, "exports")
 APP_CRASH_DIR = os.path.join(APP_DATA_DIR, "crash_dumps")
 APP_PATH = os.path.join(APP_DATA_DIR, "pc_monitor.py")
 
-APP_VERSION = "3.6"
+APP_VERSION = "3.7"
 
 # The external watchdog is a PowerShell script CARRIED INSIDE this file and
 # written to disk at setup. It runs as a Scheduled Task independently of
@@ -173,7 +173,7 @@ APP_VERSION = "3.6"
 # watchdog version to WATCHDOG_VERSION and rewrites the .ps1 when this file
 # (pulled by the watchdog) carries a newer one. Bump WATCHDOG_VERSION whenever
 # WATCHDOG_PS1 changes so deployed copies refresh.
-WATCHDOG_VERSION = "21"
+WATCHDOG_VERSION = "22"
 WATCHDOG_PS1 = r'''# PC Monitor watchdog (auto-generated from pc_monitor.py - do not edit;
 # it is overwritten from the app's embedded copy whenever this app deploys.
 $ErrorActionPreference = 'SilentlyContinue'
